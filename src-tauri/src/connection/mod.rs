@@ -51,8 +51,9 @@ impl ValidationOutcome {
 }
 
 /// Validate credentials against both servers without mutating either.
-/// Runs the (blocking) IMAP and SMTP checks; callers invoke from a blocking
-/// context (Tauri commands run on a worker thread).
+/// Runs blocking IMAP and SMTP I/O; callers must invoke this from a blocking
+/// context (e.g. `tauri::async_runtime::spawn_blocking`) — NOT from an async
+/// task directly, because the network calls block the thread.
 pub fn validate(cfg: &AccountConfig, app_password: &str) -> ValidationOutcome {
     ValidationOutcome {
         imap: to_result(imap::validate(cfg, app_password)),

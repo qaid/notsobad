@@ -24,7 +24,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let version = (i + 1) as i64;
         if version > current {
-            conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {version}; COMMIT;"))?;
+            conn.execute_batch(&format!("BEGIN;\n{sql}\n;\nPRAGMA user_version = {version};\nCOMMIT;"))?;
         }
     }
     Ok(())

@@ -31,6 +31,13 @@ pub fn insert(conn: &Connection, cfg: &AccountConfig) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// Delete an account row by id. Used to roll back an orphaned insert when the
+/// Keychain write fails immediately after (see commands::add_account).
+pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+    Ok(())
+}
+
 pub fn list(conn: &Connection) -> Result<Vec<Account>> {
     let mut stmt = conn.prepare(
         "SELECT id, display_name, username, imap_host, smtp_host FROM accounts ORDER BY id",

@@ -51,6 +51,7 @@ fn imap_validation_is_read_only() {
 #[test]
 fn smtp_validation_does_not_send() {
     use lettre::transport::smtp::SmtpTransport;
+    use lettre::transport::smtp::authentication::Credentials;
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -61,9 +62,19 @@ fn smtp_validation_does_not_send() {
         serve_smtp(stream, tx);
     });
 
-    // No credentials: the guardrail only cares that no MAIL/RCPT/DATA is sent, and
-    // skipping AUTH avoids lettre's behavior over a plaintext socket.
-    let transport = SmtpTransport::builder_dangerous("127.0.0.1").port(port).build();
+    // Build the transport the same way smtp::validate does (with credentials and
+    // port-based TLS selection), but target the plaintext recording server via
+    // builder_dangerous. This exercises the credentialed code path: if our code
+    // accidentally issued MAIL FROM, it would appear in the recorded verbs.
+    // Note: this rebuilds the transport rather than calling smtp::validate directly,
+    // because relay/starttls_relay force TLS negotiation that the plaintext server
+    // can't satisfy. A future refactor (accept pre-built transport) would close
+    // that gap fully.
+    let creds = Credentials::new("user@example.com".to_string(), "secret".to_string());
+    let transport = SmtpTransport::builder_dangerous("127.0.0.1")
+        .port(port)
+        .credentials(creds)
+        .build();
     let _ = transport.test_connection(); // result irrelevant; we assert on verbs
     server.join().unwrap();
 
@@ -73,6 +84,9 @@ fn smtp_validation_does_not_send() {
     }
     // Positive check so the denylist loop can't pass vacuously on an early error.
     assert!(verbs.contains(&"EHLO".to_string()), "expected EHLO, got: {verbs:?}");
+    // Confirm the credentialed path ran: AUTH must appear so a stray MAIL FROM
+    // in a credentialed code path would be caught.
+    assert!(verbs.contains(&"AUTH".to_string()), "expected AUTH (credentialed path), got: {verbs:?}");
 }
 
 /// Minimal plaintext IMAP server: greet, then for each tagged command echo the
@@ -111,8 +125,9 @@ fn serve_imap(stream: TcpStream, tx: Sender<String>) {
     }
 }
 
-/// Minimal plaintext SMTP server: greet, answer EHLO with a couple of caps, OK
-/// everything else, close on QUIT. Records each verb.
+/// Minimal plaintext SMTP server: greet, answer EHLO with AUTH capabilities,
+/// respond to AUTH with a challenge/success sequence, OK everything else, close
+/// on QUIT. Records each verb (first token of each client line).
 fn serve_smtp(stream: TcpStream, tx: Sender<String>) {
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
@@ -123,13 +138,37 @@ fn serve_smtp(stream: TcpStream, tx: Sender<String>) {
         line.clear();
         r.read_line(&mut line).unwrap_or(0) > 0
     } {
-        let v = verb(line.trim_end());
+        let trimmed = line.trim_end();
+        let v = verb(trimmed);
         if v.is_empty() {
             continue;
         }
         tx.send(v.clone()).unwrap();
         match v.as_str() {
-            "EHLO" | "HELO" => w.write_all(b"250-localhost\r\n250 OK\r\n").unwrap(),
+            "EHLO" | "HELO" => {
+                // Advertise AUTH so lettre's credentialed path proceeds.
+                w.write_all(b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n").unwrap()
+            }
+            "AUTH" => {
+                // For AUTH LOGIN lettre sends credentials in two follow-up lines
+                // (base64 username then password). Respond with a 334 challenge
+                // for each, then 235 authenticated.
+                let sub = trimmed.split_whitespace().nth(1).unwrap_or("").to_uppercase();
+                if sub == "PLAIN" {
+                    // AUTH PLAIN sends credentials inline; accept immediately.
+                    w.write_all(b"235 authenticated\r\n").unwrap();
+                } else {
+                    // AUTH LOGIN: issue two challenges then accept.
+                    w.write_all(b"334 VXNlcm5hbWU6\r\n").unwrap(); // "Username:"
+                    // Read username response (not a verb, so don't push to tx).
+                    line.clear();
+                    r.read_line(&mut line).unwrap_or(0);
+                    w.write_all(b"334 UGFzc3dvcmQ6\r\n").unwrap(); // "Password:"
+                    line.clear();
+                    r.read_line(&mut line).unwrap_or(0);
+                    w.write_all(b"235 authenticated\r\n").unwrap();
+                }
+            }
             "QUIT" => {
                 w.write_all(b"221 bye\r\n").unwrap();
                 break;
