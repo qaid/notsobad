@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo:*)",
+      "Bash(npm:*)",
+      "Bash(pnpm:*)",
+      "Bash(npx:*)",
+      "Bash(ollama:*)",
+      "Bash(gh:*)",
+      "Bash(git:*)"
+    ]
+  }
+}
