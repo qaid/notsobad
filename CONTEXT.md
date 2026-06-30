@@ -8,7 +8,7 @@ Spec, scope, and build order live in `docs/PRD.md`; decisions in `docs/adr/`.
 - **App category**: hybrid email **client + AI**, single user, runs **locally**.
 - **LLM**: **local models via Ollama** only; no cloud LLM at runtime.
 - **"Claude project"**: built by Claude Code; Claude is the dev tool, not a runtime dependency.
-- **Stack**: **Tauri 2.x** (Rust + web UI), **Svelte/SvelteKit** frontend, **SQLite** store. (ADR 0002)
+- **Stack**: **Tauri 2.x** (Rust + web UI) (ADR 0002), **Svelte/SvelteKit** frontend, **SQLite** store.
 - **Accounts**: one-time in-app setup; no macOS system-account reuse. IMAP/SMTP + Gmail API + Exchange Online. (ADR 0001)
 - **Labels never mutate the server**; categorization is local presentation only. (ADR 0003)
 

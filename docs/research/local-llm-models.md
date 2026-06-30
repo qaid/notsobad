@@ -33,7 +33,7 @@ Key verified insight: **parameter count is a poor predictor of translation quali
 
 ## Availability on Ollama (verified against ollama.com/library)
 
-- `eurollm` — (EuroLLM 9B/22B; see ollama.com/library, confirmed family pullable)
+- `alibayram/erurollm-9b-instruct` — community upload (~5.6GB); use this tag to pull EuroLLM-9B-IT
 - `translategemma` — pullable, 4B/12B/27B
 - `aya-expanse` — pullable, 8B (5.1GB) + 32B (20GB)
 - `gemma4` — pullable, e2b/e4b/12b/26b(MoE)/31b(dense)  ← you have e4b
