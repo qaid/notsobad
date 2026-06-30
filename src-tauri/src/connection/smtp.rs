@@ -11,7 +11,14 @@ use lettre::transport::smtp::SmtpTransport;
 pub fn validate(cfg: &AccountConfig, app_password: &str) -> Result<(), String> {
     let creds = Credentials::new(cfg.username.clone(), app_password.to_string());
 
-    let transport = SmtpTransport::starttls_relay(&cfg.smtp_host)
+    // Port picks the TLS mode: 465 = implicit TLS (SMTPS), everything else
+    // (587, 25) = STARTTLS. Covers the common providers without a UI toggle.
+    let builder = if cfg.smtp_port == 465 {
+        SmtpTransport::relay(&cfg.smtp_host)
+    } else {
+        SmtpTransport::starttls_relay(&cfg.smtp_host)
+    };
+    let transport = builder
         .map_err(|e| format!("SMTP setup failed: {e}"))?
         .port(cfg.smtp_port)
         .credentials(creds)
