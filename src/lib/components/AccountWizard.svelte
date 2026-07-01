@@ -14,12 +14,12 @@
   });
   let appPassword = $state("");
 
-  let busy = $state(false);
+  let busyAction = $state<"validate" | "save" | null>(null);
   let result = $state<ValidationOutcome | null>(null);
   let error = $state<string | null>(null);
 
   async function validate() {
-    busy = true;
+    busyAction = "validate";
     error = null;
     result = null;
     try {
@@ -27,12 +27,12 @@
     } catch (e) {
       error = String(e);
     } finally {
-      busy = false;
+      busyAction = null;
     }
   }
 
   async function save() {
-    busy = true;
+    busyAction = "save";
     error = null;
     try {
       await addAccount($state.snapshot(config), appPassword);
@@ -42,7 +42,7 @@
     } catch (e) {
       error = String(e);
     } finally {
-      busy = false;
+      busyAction = null;
     }
   }
 </script>
@@ -64,14 +64,24 @@
   </div>
 
   <div class="actions">
-    <button onclick={validate} disabled={busy}>Validate</button>
-    <button onclick={save} disabled={busy || !result?.imap.ok || !result?.smtp.ok}>
+    <button onclick={validate} disabled={busyAction !== null}>Validate</button>
+    <button
+      onclick={save}
+      disabled={busyAction !== null || !result?.imap.ok || !result?.smtp.ok}
+    >
       Save
     </button>
-    <button class="ghost" onclick={() => (app.showWizard = false)} disabled={busy}>Cancel</button>
+    <button class="ghost" onclick={() => (app.showWizard = false)} disabled={busyAction !== null}>
+      Cancel
+    </button>
   </div>
 
-  {#if busy}<p>Working…</p>{/if}
+  {#if busyAction}
+    <p class="status-busy">
+      <span class="spinner"></span>
+      {busyAction === "validate" ? "Checking credentials…" : "Saving account…"}
+    </p>
+  {/if}
   {#if error}<p class="err">{error}</p>{/if}
   {#if result}
     <ul class="status">
@@ -133,5 +143,23 @@
   .fail,
   .err {
     color: #c00;
+  }
+  .status-busy {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border, #ddd);
+    border-top-color: var(--fg, #111);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>
