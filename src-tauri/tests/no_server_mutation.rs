@@ -19,8 +19,12 @@ use std::thread;
 // `uid_store`/`uid_copy`/`uid_move` call would slip through undetected. An
 // allowlist of the exact verbs our read-only paths are permitted to send
 // fails closed instead: anything new must be added here deliberately.
+//
+// LIST (#14, folder discovery) is read-only per RFC3501 — it only enumerates
+// mailbox names, never opens or mutates one — so it belongs on the allowlist
+// alongside EXAMINE, not treated as a mutation risk.
 const IMAP_ALLOW: &[&str] =
-    &["LOGIN", "CAPABILITY", "EXAMINE", "UID SEARCH", "UID FETCH", "LOGOUT"];
+    &["LOGIN", "CAPABILITY", "EXAMINE", "LIST", "UID SEARCH", "UID FETCH", "LOGOUT"];
 const SMTP_DENY: &[&str] = &["MAIL", "RCPT", "DATA"];
 
 /// First whitespace-delimited token, uppercased — the protocol verb. For a
@@ -85,7 +89,7 @@ fn sync_is_read_only() {
 
     let client = imap::Client::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
     let mut session = client.login("user", "pass").map_err(|(e, _)| e).unwrap();
-    notsobad_lib::connection::sync_inbox_with(&mut session, None, 0).unwrap();
+    notsobad_lib::connection::sync_inbox_with(&mut session, "INBOX", None, 0).unwrap();
     drop(session);
     server.join().unwrap();
 
@@ -96,6 +100,66 @@ fn sync_is_read_only() {
     assert!(verbs.contains(&"EXAMINE".to_string()), "expected EXAMINE, got: {verbs:?}");
     assert!(verbs.contains(&"UID SEARCH".to_string()), "expected UID SEARCH, got: {verbs:?}");
     assert!(verbs.contains(&"UID FETCH".to_string()), "expected UID FETCH, got: {verbs:?}");
+}
+
+/// #14: syncing a non-INBOX folder (e.g. Archive) must EXAMINE that folder by
+/// name, never INBOX, and still send only allowlisted verbs — folder-scoping
+/// sync must not open a door to a mutating command on some other mailbox.
+#[test]
+fn folder_scoped_sync_is_read_only_and_examines_named_folder() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = channel::<String>();
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_imap(stream, tx);
+    });
+
+    let client = imap::Client::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+    let mut session = client.login("user", "pass").map_err(|(e, _)| e).unwrap();
+    notsobad_lib::connection::sync_inbox_with(&mut session, "Archive", None, 0).unwrap();
+    drop(session);
+    server.join().unwrap();
+
+    let verbs: Vec<String> = rx.try_iter().collect();
+    for v in &verbs {
+        assert!(
+            IMAP_ALLOW.contains(&v.as_str()),
+            "non-allowlisted IMAP verb sent during folder-scoped sync: {v} (all: {verbs:?})"
+        );
+    }
+    assert!(verbs.contains(&"EXAMINE".to_string()), "expected EXAMINE, got: {verbs:?}");
+    assert!(!verbs.contains(&"SELECT".to_string()), "must never SELECT, got: {verbs:?}");
+}
+
+/// #14: folder discovery (`list_folders_with`, IMAP `LIST`) must send only
+/// allowlisted verbs and never open (EXAMINE/SELECT) any mailbox — it only
+/// enumerates names.
+#[test]
+fn list_folders_is_read_only() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = channel::<String>();
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_imap(stream, tx);
+    });
+
+    let client = imap::Client::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+    let mut session = client.login("user", "pass").map_err(|(e, _)| e).unwrap();
+    let folders = notsobad_lib::connection::list_folders_with(&mut session).unwrap();
+    drop(session);
+    server.join().unwrap();
+
+    let verbs: Vec<String> = rx.try_iter().collect();
+    for v in &verbs {
+        assert!(IMAP_ALLOW.contains(&v.as_str()), "non-allowlisted IMAP verb sent during LIST: {v} (all: {verbs:?})");
+    }
+    assert!(verbs.contains(&"LIST".to_string()), "expected LIST, got: {verbs:?}");
+    assert!(!verbs.contains(&"EXAMINE".to_string()), "LIST must not open any mailbox, got: {verbs:?}");
+    assert_eq!(folders, vec!["INBOX".to_string()], "expected the fake LIST response's one folder");
 }
 
 #[test]
@@ -173,6 +237,9 @@ fn serve_imap(stream: TcpStream, tx: Sender<String>) {
             // Minimal FETCH response for UID 1: a zero-byte literal is a valid,
             // parseable empty body/header.
             w.write_all(b"* 1 FETCH (UID 1 FLAGS () BODY[] {0}\r\n)\r\n").unwrap();
+        } else if v == "LIST" {
+            // One selectable folder so list_folders_with has something to return.
+            w.write_all(b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n").unwrap();
         }
         w.write_all(format!("{tag} OK {v} done\r\n").as_bytes()).unwrap();
 

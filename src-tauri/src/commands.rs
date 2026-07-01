@@ -2,6 +2,7 @@ use crate::connection::{self, AccountConfig, ValidationOutcome};
 use crate::db::{
     self,
     accounts::Account,
+    folders::Folder,
     messages::{MessageDetail, MessageSummary},
 };
 use crate::error::{AppError, Result};
@@ -68,47 +69,103 @@ pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<Account>> {
     db::accounts::list(&conn)
 }
 
-/// Sync one account's INBOX: full mirror for the last 6 months, metadata-only
-/// further back (PRD). Read-only against the server (ADR 0003) — EXAMINE +
-/// UID SEARCH + UID FETCH BODY.PEEK[...] only, never SELECT/STORE/etc.
+/// Sync every folder on one account: full mirror for the last 6 months per
+/// folder, metadata-only further back (PRD). Read-only against the server
+/// (ADR 0003) — LIST + EXAMINE + UID SEARCH + UID FETCH BODY.PEEK[...] only,
+/// never SELECT/STORE/etc.
 ///
-/// IMAP I/O runs in `spawn_blocking`; the DB lock is acquired only after the
+/// Folder scope decision (#14): sync ALL folders automatically, no opt-in UI.
+/// This is the simplest reading of "local-first mirror" and matches the
+/// issue's own file table (no settings screen listed). Folder discovery runs
+/// on every sync call so a folder created on the server later gets picked up
+/// without a separate "rescan folders" action.
+///
+/// IMAP I/O runs in `spawn_blocking`; the DB lock is acquired only after each
 /// await, same pattern as `add_account` (`State<AppState>` is not `Send`).
 #[tauri::command]
 pub async fn sync_account(state: State<'_, AppState>, account_id: i64) -> Result<usize> {
-    let (cfg, prior_uidvalidity, prior_last_uid) = {
+    let cfg = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        let cfg = db::accounts::config(&conn, account_id)?;
-        let (uidvalidity, last_uid) = db::accounts::uid_state(&conn, account_id)?;
-        (cfg, uidvalidity, last_uid)
+        db::accounts::config(&conn, account_id)?
     };
     let app_password = keychain::get_password(account_id)?;
 
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        connection::sync::sync_inbox(
-            &cfg,
-            &app_password,
-            prior_uidvalidity.map(|v| v as u32),
-            prior_last_uid as u32,
-        )
+    let discover_cfg = cfg.clone();
+    let discover_pw = app_password.clone();
+    let folder_names = tauri::async_runtime::spawn_blocking(move || {
+        connection::sync::list_folders(&discover_cfg, &discover_pw)
     })
     .await
-    .map_err(|e| AppError::Other(format!("sync task failed: {e}")))?
+    .map_err(|e| AppError::Other(format!("list_folders task failed: {e}")))?
     .map_err(AppError::Imap)?;
 
-    let count = result.messages.len();
-    let mut conn = state.db.lock().expect("db mutex poisoned");
-    db::messages::upsert_messages(&mut conn, account_id, &result.messages, result.uid_validity_changed)?;
-    db::accounts::set_uid_state(&conn, account_id, result.uidvalidity as i64, result.max_uid as i64)?;
-    Ok(count)
+    let mut total = 0usize;
+    for folder_name in folder_names {
+        let folder_id = {
+            let conn = state.db.lock().expect("db mutex poisoned");
+            db::folders::get_or_create(&conn, account_id, &folder_name)?
+        };
+        let (prior_uidvalidity, prior_last_uid) = {
+            let conn = state.db.lock().expect("db mutex poisoned");
+            db::folders::uid_state(&conn, folder_id)?
+        };
+
+        let sync_cfg = cfg.clone();
+        let sync_pw = app_password.clone();
+        let folder_for_sync = folder_name.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            connection::sync::sync_inbox(
+                &sync_cfg,
+                &sync_pw,
+                &folder_for_sync,
+                prior_uidvalidity.map(|v| v as u32),
+                prior_last_uid as u32,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Other(format!("sync task failed: {e}")))?
+        .map_err(AppError::Imap)?;
+
+        total += result.messages.len();
+        let mut conn = state.db.lock().expect("db mutex poisoned");
+        db::messages::upsert_messages(
+            &mut conn,
+            account_id,
+            folder_id,
+            &result.messages,
+            result.uid_validity_changed,
+        )?;
+        db::folders::set_uid_state(&conn, folder_id, result.uidvalidity as i64, result.max_uid as i64)?;
+    }
+    Ok(total)
 }
 
-/// Unified inbox list (one row per thread, newest first). `account_id = None`
-/// spans all accounts.
+/// This account's tracked folders (populated by `sync_account`'s discovery).
+#[tauri::command]
+pub fn list_folders(state: State<'_, AppState>, account_id: i64) -> Result<Vec<Folder>> {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    db::folders::list(&conn, account_id)
+}
+
+/// Inbox list (one row per thread, newest first), scoped to INBOX only —
+/// syncing other folders (#14) must not change what shows up here.
+/// `account_id = None` spans all accounts' INBOXes.
 #[tauri::command]
 pub fn list_inbox(state: State<'_, AppState>, account_id: Option<i64>) -> Result<Vec<MessageSummary>> {
     let conn = state.db.lock().expect("db mutex poisoned");
     db::messages::list_inbox(&conn, account_id)
+}
+
+/// One folder's message list (one row per thread, newest first), scoped by
+/// name so non-INBOX folders (e.g. Archive) can be viewed explicitly.
+#[tauri::command]
+pub fn list_folder_messages(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    folder_name: String,
+) -> Result<Vec<MessageSummary>> {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    db::messages::list_folder_messages(&conn, account_id, &folder_name)
 }
 
 /// Full conversation for a thread, oldest first, scoped to one account.
@@ -135,14 +192,14 @@ pub struct MessageBody {
 /// BODY.PEEK[] — never sets \Seen server-side).
 #[tauri::command]
 pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result<MessageBody> {
-    let (account_id, uid, existing_body, existing_is_html) = {
+    let (account_id, uid, folder_name, existing_body, existing_is_html) = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        let (account_id, uid) = db::messages::account_and_uid(&conn, message_id)?;
+        let (account_id, uid, folder_name) = db::messages::account_and_uid(&conn, message_id)?;
         let (existing_body, existing_is_html): (Option<String>, i64) = conn
             .query_row("SELECT body, body_is_html FROM messages WHERE id = ?1", [message_id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
-        (account_id, uid, existing_body, existing_is_html)
+        (account_id, uid, folder_name, existing_body, existing_is_html)
     };
     if let Some(body) = existing_body {
         return Ok(MessageBody { body, body_is_html: existing_is_html != 0 });
@@ -155,7 +212,7 @@ pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result
     let app_password = keychain::get_password(account_id)?;
 
     let fetched = tauri::async_runtime::spawn_blocking(move || {
-        connection::sync::fetch_body(&cfg, &app_password, uid as u32)
+        connection::sync::fetch_body(&cfg, &app_password, &folder_name, uid as u32)
     })
     .await
     .map_err(|e| AppError::Other(format!("fetch_body task failed: {e}")))?

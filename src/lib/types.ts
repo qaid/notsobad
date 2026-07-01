@@ -20,6 +20,13 @@ export type Account = {
   smtp_host: string;
 };
 
+// Mirrors db::folders::Folder. Populated by sync_account's folder discovery.
+export type Folder = {
+  id: number;
+  account_id: number;
+  name: string;
+};
+
 // Mirrors db::messages::{MessageSummary, MessageDetail}.
 export type MessageSummary = {
   id: number;

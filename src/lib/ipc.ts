@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
   AccountConfig,
+  Folder,
   MessageDetail,
   MessageSummary,
   ValidationOutcome,
@@ -17,14 +18,22 @@ export const addAccount = (config: AccountConfig, appPassword: string) =>
 
 export const listAccounts = () => invoke<Account[]>("list_accounts");
 
-// Sync one account's INBOX (full mirror for the last 6 months, metadata-only
-// further back). Read-only against the server (ADR 0003).
+// Sync every folder on the account (full mirror for the last 6 months per
+// folder, metadata-only further back). Read-only against the server (ADR 0003).
 export const syncAccount = (accountId: number) =>
   invoke<number>("sync_account", { accountId });
 
-// Unified inbox: one row per thread, newest first. Pass null/undefined for accountId to span all accounts.
+// This account's tracked folders, discovered by the last sync_account call.
+export const listFolders = (accountId: number) =>
+  invoke<Folder[]>("list_folders", { accountId });
+
+// Inbox list: one row per thread, newest first, INBOX only. Pass null/undefined for accountId to span all accounts.
 export const listInbox = (accountId?: number) =>
   invoke<MessageSummary[]>("list_inbox", { accountId: accountId ?? null });
+
+// One named folder's message list (one row per thread, newest first).
+export const listFolderMessages = (folderName: string, accountId?: number) =>
+  invoke<MessageSummary[]>("list_folder_messages", { accountId: accountId ?? null, folderName });
 
 export const threadMessages = (accountId: number, threadId: string) =>
   invoke<MessageDetail[]>("thread_messages", { accountId, threadId });

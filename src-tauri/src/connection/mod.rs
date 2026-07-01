@@ -20,6 +20,8 @@ pub mod sync;
 pub use imap::run_readonly_checks;
 #[doc(hidden)]
 pub use sync::sync_inbox_with;
+#[doc(hidden)]
+pub use sync::list_folders_with;
 
 use serde::{Deserialize, Serialize};
 

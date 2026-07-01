@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app, syncAndRefresh } from "../store.svelte";
+  import { app, selectFolder, syncAndRefresh } from "../store.svelte";
 
   let syncing = $state<number | null>(null);
 
@@ -10,6 +10,12 @@
     } finally {
       syncing = null;
     }
+  }
+
+  function isCurrent(accountId: number, name: string) {
+    return name === "INBOX"
+      ? app.currentFolder === null
+      : app.currentFolder?.accountId === accountId && app.currentFolder?.name === name;
   }
 </script>
 
@@ -27,6 +33,21 @@
             {syncing === acct.id ? "…" : "Sync"}
           </button>
         </div>
+        {#if app.folders[acct.id]?.length}
+          <ul class="folders">
+            {#each app.folders[acct.id] as folder (folder.id)}
+              <li>
+                <button
+                  class="folder"
+                  class:current={isCurrent(acct.id, folder.name)}
+                  onclick={() => selectFolder(acct.id, folder.name)}
+                >
+                  {folder.name}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </li>
     {:else}
       <li class="empty">No accounts yet</li>
@@ -84,5 +105,31 @@
   .empty {
     opacity: 0.5;
     font-style: italic;
+  }
+  .folders {
+    margin-top: 4px;
+    gap: 2px;
+  }
+  .folders li {
+    padding: 0;
+  }
+  .folder {
+    width: 100%;
+    text-align: left;
+    padding: 3px 8px 3px 16px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.85em;
+    opacity: 0.75;
+    border-radius: 6px;
+  }
+  .folder:hover {
+    background: rgba(0, 0, 0, 0.05);
+  }
+  .folder.current {
+    font-weight: 600;
+    opacity: 1;
   }
 </style>
