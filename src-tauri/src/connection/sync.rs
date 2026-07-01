@@ -1,9 +1,11 @@
-//! INBOX sync (#3): read-only mirror of recent + metadata-only older mail.
+//! Folder sync (#3 INBOX-only, generalized to any folder in #14): read-only
+//! mirror of recent + metadata-only older mail, plus folder discovery.
 //!
-//! SAFETY (ADR 0003): EXAMINE (never SELECT), UID SEARCH, UID FETCH with
-//! BODY.PEEK[...] (never bare BODY[...], which would set \Seen server-side).
-//! No STORE/MOVE/EXPUNGE/COPY ever. The guardrail test drives this module's
-//! logic over a plaintext recording socket and asserts on the verbs sent.
+//! SAFETY (ADR 0003): EXAMINE (never SELECT), LIST (read-only folder
+//! discovery), UID SEARCH, UID FETCH with BODY.PEEK[...] (never bare
+//! BODY[...], which would set \Seen server-side). No STORE/MOVE/EXPUNGE/COPY
+//! ever. The guardrail test drives this module's logic over a plaintext
+//! recording socket and asserts on the verbs sent.
 
 use super::AccountConfig;
 use mail_parser::{HeaderValue, MessageParser, MimeHeaders};
@@ -85,37 +87,68 @@ pub(super) fn connect_and_login(
     client.login(&cfg.username, app_password).map_err(|(e, _client)| format!("login failed: {e}"))
 }
 
-/// Connect, log in, and EXAMINE INBOX (read-only). Used by sync's entry point.
+/// Connect, log in, and EXAMINE the given folder (read-only). Used by sync's
+/// entry point.
 fn connect_and_examine(
     cfg: &AccountConfig,
     app_password: &str,
+    folder: &str,
 ) -> Result<imap::Session<native_tls::TlsStream<TcpStream>>, String> {
     let mut session = connect_and_login(cfg, app_password)?;
-    session.examine("INBOX").map_err(|e| format!("examine INBOX failed: {e}"))?;
+    session.examine(folder).map_err(|e| format!("examine {folder} failed: {e}"))?;
     Ok(session)
 }
 
-/// Sync INBOX: full mirror for the last 6 months, metadata-only further back.
-/// `prior_uidvalidity`/`prior_last_uid` come from `accounts` and drive the
-/// incremental fetch; pass `prior_last_uid = 0` for a first sync.
-pub fn sync_inbox(
+/// Enumerate this account's IMAP folders via `LIST "" "*"` (read-only, ADR
+/// 0003 — LIST never mutates the server). Used by the folder picker to
+/// discover what's there.
+pub fn list_folders(cfg: &AccountConfig, app_password: &str) -> Result<Vec<String>, String> {
+    let mut session = connect_and_login(cfg, app_password)?;
+    let folders = list_folders_with(&mut session)?;
+    let _ = session.logout();
+    Ok(folders)
+}
+
+/// The folder-listing logic, generic over the transport so the guardrail test
+/// can drive it over a plaintext recording socket. Filters out `\Noselect`
+/// names (e.g. purely hierarchical nodes) since those can never be EXAMINEd.
+pub fn list_folders_with<T: Read + Write>(session: &mut imap::Session<T>) -> Result<Vec<String>, String> {
+    let names = session
+        .list(Some(""), Some("*"))
+        .map_err(|e| format!("list folders failed: {e}"))?;
+    Ok(names
+        .iter()
+        .filter(|n| !n.attributes().contains(&imap::types::NameAttribute::NoSelect))
+        .map(|n| n.name().to_string())
+        .collect())
+}
+
+/// Discover all folders via one `LIST`, keeping the session open so the
+/// caller can sync a subset of them afterward without reconnecting. Returns
+/// the still-open session plus the discovered names.
+///
+/// Split from folder sync (rather than one do-everything call) because
+/// deciding WHICH discovered folders to actually sync depends on the
+/// `selected` flags in SQLite (#14 rework: opt-in per folder) — that lookup
+/// happens on the async/DB side, between this call and `sync_folders_with`.
+pub fn connect_and_list_folders(
     cfg: &AccountConfig,
     app_password: &str,
-    prior_uidvalidity: Option<u32>,
-    prior_last_uid: u32,
-) -> Result<SyncResult, String> {
-    let mut session = connect_and_examine(cfg, app_password)?;
-    sync_inbox_with(&mut session, prior_uidvalidity, prior_last_uid)
+) -> Result<(imap::Session<native_tls::TlsStream<TcpStream>>, Vec<String>), String> {
+    let mut session = connect_and_login(cfg, app_password)?;
+    let folders = list_folders_with(&mut session)?;
+    Ok((session, folders))
 }
 
 /// The sync logic, generic over the transport so the guardrail test can drive
 /// it over a plaintext recording socket (same pattern as run_readonly_checks).
 pub fn sync_inbox_with<T: Read + Write>(
     session: &mut imap::Session<T>,
+    folder: &str,
     prior_uidvalidity: Option<u32>,
     prior_last_uid: u32,
 ) -> Result<SyncResult, String> {
-    let mailbox = session.examine("INBOX").map_err(|e| format!("examine INBOX failed: {e}"))?;
+    let mailbox = session.examine(folder).map_err(|e| format!("examine {folder} failed: {e}"))?;
     let uidvalidity = mailbox.uid_validity.unwrap_or(0);
     let uid_validity_changed = prior_uidvalidity.is_some_and(|v| v != uidvalidity);
     let since_uid = if uid_validity_changed { 0 } else { prior_last_uid };
@@ -171,7 +204,6 @@ pub fn sync_inbox_with<T: Read + Write>(
         }
     }
 
-    let _ = session.logout();
     Ok(SyncResult { messages, uidvalidity, max_uid, uid_validity_changed })
 }
 
@@ -192,8 +224,8 @@ pub struct FetchedBody {
 /// not `Err` — the caller can't tell "genuinely empty" from "fetch failed"
 /// from an error alone, and the frontend treats a thrown error and an empty
 /// string differently (see ThreadReader's loadBody).
-pub fn fetch_body(cfg: &AccountConfig, app_password: &str, uid: u32) -> Result<FetchedBody, String> {
-    let mut session = connect_and_examine(cfg, app_password)?;
+pub fn fetch_body(cfg: &AccountConfig, app_password: &str, folder: &str, uid: u32) -> Result<FetchedBody, String> {
+    let mut session = connect_and_examine(cfg, app_password, folder)?;
     let fetches = session
         .uid_fetch(uid.to_string(), "BODY.PEEK[]")
         .map_err(|e| format!("uid fetch failed: {e}"))?;

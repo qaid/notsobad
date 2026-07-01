@@ -58,23 +58,10 @@ pub fn config(conn: &Connection, account_id: i64) -> Result<AccountConfig> {
     )?)
 }
 
-/// Prior UID-sync bookkeeping for an account: (uidvalidity, last_uid).
-pub fn uid_state(conn: &Connection, account_id: i64) -> Result<(Option<i64>, i64)> {
-    Ok(conn.query_row(
-        "SELECT uidvalidity, last_uid FROM accounts WHERE id = ?1",
-        [account_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?)
-}
-
-/// Persist UID-sync bookkeeping after a sync pass.
-pub fn set_uid_state(conn: &Connection, account_id: i64, uidvalidity: i64, last_uid: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE accounts SET uidvalidity = ?1, last_uid = ?2 WHERE id = ?3",
-        rusqlite::params![uidvalidity, last_uid, account_id],
-    )?;
-    Ok(())
-}
+// UID-sync bookkeeping moved to db::folders (#14) — a single account-level
+// uidvalidity/last_uid pair only made sense while INBOX was the only synced
+// mailbox. The accounts.uidvalidity/last_uid columns still exist (dropping
+// needs a table rebuild) but are no longer read or written.
 
 pub fn list(conn: &Connection) -> Result<Vec<Account>> {
     let mut stmt = conn.prepare(

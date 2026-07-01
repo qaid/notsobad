@@ -2,6 +2,7 @@ use crate::connection::{self, AccountConfig, ValidationOutcome};
 use crate::db::{
     self,
     accounts::Account,
+    folders::Folder,
     messages::{MessageDetail, MessageSummary},
 };
 use crate::error::{AppError, Result};
@@ -68,47 +69,166 @@ pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<Account>> {
     db::accounts::list(&conn)
 }
 
-/// Sync one account's INBOX: full mirror for the last 6 months, metadata-only
-/// further back (PRD). Read-only against the server (ADR 0003) — EXAMINE +
-/// UID SEARCH + UID FETCH BODY.PEEK[...] only, never SELECT/STORE/etc.
+/// Sync one account's selected folders: full mirror for the last 6 months
+/// per folder, metadata-only further back (PRD). Read-only against the
+/// server (ADR 0003) — LIST + EXAMINE + UID SEARCH + UID FETCH
+/// BODY.PEEK[...] only, never SELECT/STORE/etc.
 ///
-/// IMAP I/O runs in `spawn_blocking`; the DB lock is acquired only after the
+/// Folder scope (#14 rework, opt-in): `LIST` still discovers and upserts
+/// every folder on every call (so the sidebar picker always shows the full
+/// set, including ones created on the server since last sync), but only
+/// folders with `selected = true` are actually synced. INBOX defaults
+/// selected on first discovery; everything else is opt-in via
+/// `set_folder_selected`.
+///
+/// One IMAP session for the whole call (connect+login once), not one per
+/// folder: discovery's `LIST` and every folder's `EXAMINE`/sync reuse the
+/// same session, closed with a single `LOGOUT` at the end.
+///
+/// IMAP I/O runs in `spawn_blocking`; the DB lock is acquired only after each
 /// await, same pattern as `add_account` (`State<AppState>` is not `Send`).
+/// The live `imap::Session` is handed between two `spawn_blocking` calls
+/// (discovery, then sync) with a DB round-trip in between — selection must be
+/// read AFTER this call's own discovery has upserted newly-seen folders, or a
+/// brand-new account's just-discovered INBOX would default to selected in
+/// SQLite but never get synced on this same call.
+///
+/// Matches `selected` (persisted in SQLite, can outlive a folder's presence
+/// on the server) against `ids_by_name` (this call's fresh `LIST` results).
+/// A folder can be selected from a past sync yet absent from a later LIST —
+/// deleted, renamed, or flipped `\Noselect` server-side — since discovery
+/// only ever inserts folder rows, it never prunes stale selections. Skips
+/// rather than indexes, so a vanished folder can't panic; a bare `map[&name]`
+/// index panic here would poison `state.db`'s mutex for the rest of the
+/// app's lifetime, not just fail this one sync.
+fn selected_present_in_listing(
+    ids_by_name: &std::collections::HashMap<String, i64>,
+    selected: Vec<String>,
+) -> Vec<(String, i64)> {
+    selected.into_iter().filter_map(|name| ids_by_name.get(&name).map(|&id| (name, id))).collect()
+}
 #[tauri::command]
 pub async fn sync_account(state: State<'_, AppState>, account_id: i64) -> Result<usize> {
-    let (cfg, prior_uidvalidity, prior_last_uid) = {
+    let cfg = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        let cfg = db::accounts::config(&conn, account_id)?;
-        let (uidvalidity, last_uid) = db::accounts::uid_state(&conn, account_id)?;
-        (cfg, uidvalidity, last_uid)
+        db::accounts::config(&conn, account_id)?
     };
     let app_password = keychain::get_password(account_id)?;
 
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        connection::sync::sync_inbox(
-            &cfg,
-            &app_password,
-            prior_uidvalidity.map(|v| v as u32),
-            prior_last_uid as u32,
-        )
+    let discover_cfg = cfg.clone();
+    let discover_pw = app_password.clone();
+    let (mut session, folder_names) = tauri::async_runtime::spawn_blocking(move || {
+        connection::sync::connect_and_list_folders(&discover_cfg, &discover_pw)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("list_folders task failed: {e}")))?
+    .map_err(AppError::Imap)?;
+
+    let folder_ids_and_state: Vec<(String, i64, Option<i64>, i64)> = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let mut ids_by_name = std::collections::HashMap::with_capacity(folder_names.len());
+        for folder_name in &folder_names {
+            let folder_id = db::folders::get_or_create(&conn, account_id, folder_name)?;
+            ids_by_name.insert(folder_name.clone(), folder_id);
+        }
+        // Read the selected set AFTER upserting discovery's results, so a
+        // brand-new account's just-discovered (and default-selected) INBOX
+        // is syncable in this same call, not just from the next one.
+        let selected = db::folders::selected_names(&conn, account_id)?;
+        selected_present_in_listing(&ids_by_name, selected)
+            .into_iter()
+            .map(|(name, folder_id)| {
+                let (uidvalidity, last_uid) = db::folders::uid_state(&conn, folder_id)?;
+                Ok((name, folder_id, uidvalidity, last_uid))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let sync_targets = folder_ids_and_state
+        .iter()
+        .map(|(name, _, uidvalidity, last_uid)| (name.clone(), *uidvalidity, *last_uid))
+        .collect::<Vec<_>>();
+    let results = tauri::async_runtime::spawn_blocking(move || -> std::result::Result<_, String> {
+        let mut results = Vec::with_capacity(sync_targets.len());
+        for (name, prior_uidvalidity, prior_last_uid) in sync_targets {
+            let result = connection::sync::sync_inbox_with(
+                &mut session,
+                &name,
+                prior_uidvalidity.map(|v| v as u32),
+                prior_last_uid as u32,
+            )?;
+            results.push((name, result));
+        }
+        let _ = session.logout();
+        Ok(results)
     })
     .await
     .map_err(|e| AppError::Other(format!("sync task failed: {e}")))?
     .map_err(AppError::Imap)?;
 
-    let count = result.messages.len();
-    let mut conn = state.db.lock().expect("db mutex poisoned");
-    db::messages::upsert_messages(&mut conn, account_id, &result.messages, result.uid_validity_changed)?;
-    db::accounts::set_uid_state(&conn, account_id, result.uidvalidity as i64, result.max_uid as i64)?;
-    Ok(count)
+    let mut total = 0usize;
+    for (folder_name, result) in results {
+        let folder_id = folder_ids_and_state
+            .iter()
+            .find(|(name, ..)| name == &folder_name)
+            .map(|(_, id, ..)| *id)
+            .expect("synced folder was looked up from folder_ids_and_state");
+
+        total += result.messages.len();
+        let mut conn = state.db.lock().expect("db mutex poisoned");
+        db::messages::upsert_messages(
+            &mut conn,
+            account_id,
+            folder_id,
+            &result.messages,
+            result.uid_validity_changed,
+        )?;
+        db::folders::set_uid_state(&conn, folder_id, result.uidvalidity as i64, result.max_uid as i64)?;
+    }
+    Ok(total)
 }
 
-/// Unified inbox list (one row per thread, newest first). `account_id = None`
-/// spans all accounts.
+/// Toggle a folder's opt-in sync selection (#14 rework). Pure SQLite write —
+/// issues no IMAP traffic. The frontend triggers a full `sync_account` call
+/// right after turning a folder on, rather than this command syncing it
+/// directly, so there's exactly one code path that talks to the server.
+#[tauri::command]
+pub fn set_folder_selected(
+    state: State<'_, AppState>,
+    account_id: i64,
+    folder_name: String,
+    selected: bool,
+) -> Result<()> {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    db::folders::set_selected(&conn, account_id, &folder_name, selected)
+}
+
+/// This account's tracked folders (populated by `sync_account`'s discovery).
+#[tauri::command]
+pub fn list_folders(state: State<'_, AppState>, account_id: i64) -> Result<Vec<Folder>> {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    db::folders::list(&conn, account_id)
+}
+
+/// Inbox list (one row per thread, newest first), scoped to INBOX only —
+/// syncing other folders (#14) must not change what shows up here.
+/// `account_id = None` spans all accounts' INBOXes.
 #[tauri::command]
 pub fn list_inbox(state: State<'_, AppState>, account_id: Option<i64>) -> Result<Vec<MessageSummary>> {
     let conn = state.db.lock().expect("db mutex poisoned");
     db::messages::list_inbox(&conn, account_id)
+}
+
+/// One folder's message list (one row per thread, newest first), scoped by
+/// name so non-INBOX folders (e.g. Archive) can be viewed explicitly.
+#[tauri::command]
+pub fn list_folder_messages(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    folder_name: String,
+) -> Result<Vec<MessageSummary>> {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    db::messages::list_folder_messages(&conn, account_id, &folder_name)
 }
 
 /// Full conversation for a thread, oldest first, scoped to one account.
@@ -135,14 +255,14 @@ pub struct MessageBody {
 /// BODY.PEEK[] — never sets \Seen server-side).
 #[tauri::command]
 pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result<MessageBody> {
-    let (account_id, uid, existing_body, existing_is_html) = {
+    let (account_id, uid, folder_name, existing_body, existing_is_html) = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        let (account_id, uid) = db::messages::account_and_uid(&conn, message_id)?;
+        let (account_id, uid, folder_name) = db::messages::account_and_uid(&conn, message_id)?;
         let (existing_body, existing_is_html): (Option<String>, i64) = conn
             .query_row("SELECT body, body_is_html FROM messages WHERE id = ?1", [message_id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
-        (account_id, uid, existing_body, existing_is_html)
+        (account_id, uid, folder_name, existing_body, existing_is_html)
     };
     if let Some(body) = existing_body {
         return Ok(MessageBody { body, body_is_html: existing_is_html != 0 });
@@ -155,7 +275,7 @@ pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result
     let app_password = keychain::get_password(account_id)?;
 
     let fetched = tauri::async_runtime::spawn_blocking(move || {
-        connection::sync::fetch_body(&cfg, &app_password, uid as u32)
+        connection::sync::fetch_body(&cfg, &app_password, &folder_name, uid as u32)
     })
     .await
     .map_err(|e| AppError::Other(format!("fetch_body task failed: {e}")))?
@@ -175,4 +295,40 @@ pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result
         },
     )?;
     Ok(MessageBody { body: fetched.body, body_is_html })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_present_in_listing;
+    use std::collections::HashMap;
+
+    #[test]
+    fn drops_a_selected_folder_no_longer_in_the_listing() {
+        let mut ids_by_name = HashMap::new();
+        ids_by_name.insert("INBOX".to_string(), 1);
+        ids_by_name.insert("Archive".to_string(), 2);
+
+        // "Deleted" is selected in SQLite from a past sync but this call's
+        // LIST no longer reports it (removed/renamed/\Noselect server-side).
+        let selected =
+            vec!["INBOX".to_string(), "Archive".to_string(), "Deleted".to_string()];
+
+        let result = selected_present_in_listing(&ids_by_name, selected);
+
+        assert_eq!(
+            result,
+            vec![("INBOX".to_string(), 1), ("Archive".to_string(), 2)],
+            "must silently drop the vanished folder, not panic"
+        );
+    }
+
+    #[test]
+    fn keeps_every_selected_folder_still_listed() {
+        let mut ids_by_name = HashMap::new();
+        ids_by_name.insert("INBOX".to_string(), 1);
+
+        let result = selected_present_in_listing(&ids_by_name, vec!["INBOX".to_string()]);
+
+        assert_eq!(result, vec![("INBOX".to_string(), 1)]);
+    }
 }
