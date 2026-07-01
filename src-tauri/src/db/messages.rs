@@ -158,11 +158,26 @@ pub fn list_folder_messages(
 /// Full conversation for a thread, oldest first. Scoped to `account_id` so two
 /// accounts that happen to produce the same thread_id (mailing list copy,
 /// self-CC, shared References chain) never mix messages in one reader view.
+///
+/// Deduped by `message_id` (Message-ID header, falling back to the row id for
+/// the rare message that has none): since #14, sync writes one row per
+/// folder a message appears in (e.g. Gmail's INBOX + All Mail both hold the
+/// same physical message under the same folder-agnostic thread_id), so a
+/// naive `WHERE thread_id = ?` returns duplicate rows for one message. Picks
+/// the lowest row id per identity — arbitrary but stable; which folder's copy
+/// "wins" doesn't matter for display since body content is identical.
 pub fn thread_messages(conn: &Connection, account_id: i64, thread_id: &str) -> Result<Vec<MessageDetail>> {
     let mut stmt = conn.prepare(
         "SELECT id, account_id, from_name, from_addr, subject, headers, body, body_is_html,
                 received_at, seen, mirror_state, uid
-         FROM messages WHERE account_id = ?1 AND thread_id = ?2 ORDER BY received_at ASC",
+         FROM messages
+         WHERE account_id = ?1 AND thread_id = ?2
+         AND id IN (
+             SELECT MIN(id) FROM messages
+             WHERE account_id = ?1 AND thread_id = ?2
+             GROUP BY COALESCE(message_id, 'id:' || id)
+         )
+         ORDER BY received_at ASC",
     )?;
     let rows = stmt.query_map(params![account_id, thread_id], |r| {
         Ok(MessageDetail {
@@ -260,5 +275,61 @@ mod tests {
         assert_eq!(got_account_id, account_id);
         assert_eq!(got_uid, 9);
         assert_eq!(got_folder_name, "Archive", "must resolve the message's own folder, not INBOX");
+    }
+
+    /// Regression for the review-flagged duplicate-thread bug: since #14,
+    /// sync writes one row per folder a message appears in (e.g. Gmail's
+    /// INBOX + All Mail both holding the same physical message under the
+    /// same folder-agnostic thread_id). Without dedup, opening that thread
+    /// would return two rows for what is really one message.
+    #[test]
+    fn thread_messages_dedupes_the_same_message_synced_into_two_folders() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations_for_test(&conn);
+        conn.execute(
+            "INSERT INTO accounts (display_name, imap_host, imap_port, smtp_host, smtp_port, username)
+             VALUES ('Test', 'imap.example', 993, 'smtp.example', 465, 'user@example.com')",
+            [],
+        )
+        .unwrap();
+        let account_id = conn.last_insert_rowid();
+        let inbox_id = folders::get_or_create(&conn, account_id, "INBOX").unwrap();
+        let all_mail_id = folders::get_or_create(&conn, account_id, "[Gmail]/All Mail").unwrap();
+
+        // Same physical message (same Message-ID, same thread_id), synced
+        // once per folder it lives in — exactly what sync.rs's per-folder
+        // upsert produces for Gmail's INBOX + All Mail overlap.
+        conn.execute(
+            "INSERT INTO messages (account_id, folder_id, uid, message_id, headers, mirror_state, thread_id, received_at)
+             VALUES (?1, ?2, 1, 'dup@x.example', 'Subject: hi', 'full', 'thread-1', '2026-01-01T00:00:00Z')",
+            params![account_id, inbox_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (account_id, folder_id, uid, message_id, headers, mirror_state, thread_id, received_at)
+             VALUES (?1, ?2, 1, 'dup@x.example', 'Subject: hi', 'full', 'thread-1', '2026-01-01T00:00:00Z')",
+            params![account_id, all_mail_id],
+        )
+        .unwrap();
+        // A second, distinct message in the same thread (a reply) to confirm
+        // dedup doesn't over-collapse unrelated rows sharing a thread_id.
+        conn.execute(
+            "INSERT INTO messages (account_id, folder_id, uid, message_id, headers, mirror_state, thread_id, received_at)
+             VALUES (?1, ?2, 2, 'reply@x.example', 'Subject: re: hi', 'full', 'thread-1', '2026-01-02T00:00:00Z')",
+            params![account_id, inbox_id],
+        )
+        .unwrap();
+
+        let messages = thread_messages(&conn, account_id, "thread-1").unwrap();
+        assert_eq!(messages.len(), 2, "duplicate folder-copy must be deduped, the distinct reply kept");
+        // Order must survive the dedup subquery's GROUP BY: oldest (the
+        // original, uid 1, 2026-01-01) first, then the reply (uid 2,
+        // 2026-01-02) — an accidental order-loss in the GROUP BY/MIN(id)
+        // dedup would silently show the reply before the message it's
+        // replying to.
+        assert_eq!(messages[0].uid, 1, "oldest message (the original) must sort first");
+        assert_eq!(messages[0].received_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(messages[1].uid, 2, "the reply must sort second");
+        assert_eq!(messages[1].received_at.as_deref(), Some("2026-01-02T00:00:00Z"));
     }
 }

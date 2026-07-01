@@ -6,18 +6,26 @@ use crate::error::Result;
 use rusqlite::{OptionalExtension, Connection};
 use serde::Serialize;
 
-/// A folder row for the sidebar's folder picker. No sync bookkeeping —
-/// that's internal to sync, not display.
+/// A folder row for the sidebar's folder picker. No UID-sync bookkeeping —
+/// that's internal to sync, not display. `selected` drives opt-in sync
+/// (#14 rework): only selected folders are looped over by `sync_account`.
 #[derive(Debug, Serialize)]
 pub struct Folder {
     pub id: i64,
     pub account_id: i64,
     pub name: String,
+    pub selected: bool,
 }
 
 /// Get a folder's id by (account_id, name), inserting a fresh row (UID state
 /// zeroed) if it doesn't exist yet. Folder discovery (`list_folders`) and sync
 /// both call this so a folder becomes trackable the first time it's seen.
+///
+/// Default selection on first discovery: INBOX is selected (preserves
+/// pre-#14-rework behavior, which already synced it); every other folder
+/// defaults unselected (opt-in). This only applies to the INSERT branch — an
+/// existing folder's `selected` flag is never touched here, so re-running
+/// discovery doesn't clobber a user's toggle.
 pub fn get_or_create(conn: &Connection, account_id: i64, name: &str) -> Result<i64> {
     let existing: Option<i64> = conn
         .query_row(
@@ -29,11 +37,31 @@ pub fn get_or_create(conn: &Connection, account_id: i64, name: &str) -> Result<i
     if let Some(id) = existing {
         return Ok(id);
     }
+    let selected = name == "INBOX";
     conn.execute(
-        "INSERT INTO folders (account_id, name) VALUES (?1, ?2)",
-        rusqlite::params![account_id, name],
+        "INSERT INTO folders (account_id, name, selected) VALUES (?1, ?2, ?3)",
+        rusqlite::params![account_id, name, selected as i64],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Set a folder's opt-in sync selection (`set_folder_selected` command).
+/// Pure SQLite — issues no IMAP traffic.
+pub fn set_selected(conn: &Connection, account_id: i64, name: &str, selected: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET selected = ?1 WHERE account_id = ?2 AND name = ?3",
+        rusqlite::params![selected as i64, account_id, name],
+    )?;
+    Ok(())
+}
+
+/// Folder ids + names selected for sync on this account (used by
+/// `sync_account` after discovery/upsert has run).
+pub fn selected_names(conn: &Connection, account_id: i64) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM folders WHERE account_id = ?1 AND selected = 1 ORDER BY name")?;
+    let rows = stmt.query_map([account_id], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Prior UID-sync bookkeeping for a folder: (uidvalidity, last_uid).
@@ -56,9 +84,15 @@ pub fn set_uid_state(conn: &Connection, folder_id: i64, uidvalidity: i64, last_u
 
 /// All tracked folders for an account, alphabetical (INBOX included once synced).
 pub fn list(conn: &Connection, account_id: i64) -> Result<Vec<Folder>> {
-    let mut stmt = conn.prepare("SELECT id, account_id, name FROM folders WHERE account_id = ?1 ORDER BY name")?;
+    let mut stmt =
+        conn.prepare("SELECT id, account_id, name, selected FROM folders WHERE account_id = ?1 ORDER BY name")?;
     let rows = stmt.query_map([account_id], |r| {
-        Ok(Folder { id: r.get(0)?, account_id: r.get(1)?, name: r.get(2)? })
+        Ok(Folder {
+            id: r.get(0)?,
+            account_id: r.get(1)?,
+            name: r.get(2)?,
+            selected: r.get::<_, i64>(3)? != 0,
+        })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -122,5 +156,59 @@ mod tests {
         let folders = list(&conn, a1).unwrap();
         assert_eq!(folders.len(), 2);
         assert!(folders.iter().all(|f| f.account_id == a1));
+    }
+
+    /// #14 rework: on first discovery, INBOX defaults to selected (preserves
+    /// today's syncing behavior) and every other folder defaults unselected
+    /// (opt-in) — so a brand-new account only auto-syncs INBOX.
+    #[test]
+    fn get_or_create_defaults_inbox_selected_and_others_unselected() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations_for_test(&conn);
+        let account_id = setup_account(&conn);
+
+        get_or_create(&conn, account_id, "INBOX").unwrap();
+        get_or_create(&conn, account_id, "Archive").unwrap();
+
+        let folders = list(&conn, account_id).unwrap();
+        let inbox = folders.iter().find(|f| f.name == "INBOX").unwrap();
+        let archive = folders.iter().find(|f| f.name == "Archive").unwrap();
+        assert!(inbox.selected, "INBOX must default to selected");
+        assert!(!archive.selected, "non-INBOX folders must default to unselected");
+    }
+
+    #[test]
+    fn set_selected_toggles_without_touching_other_folders() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations_for_test(&conn);
+        let account_id = setup_account(&conn);
+        get_or_create(&conn, account_id, "INBOX").unwrap();
+        get_or_create(&conn, account_id, "Archive").unwrap();
+
+        set_selected(&conn, account_id, "Archive", true).unwrap();
+        let folders = list(&conn, account_id).unwrap();
+        assert!(folders.iter().find(|f| f.name == "Archive").unwrap().selected);
+        assert!(folders.iter().find(|f| f.name == "INBOX").unwrap().selected, "INBOX untouched by unrelated toggle");
+
+        set_selected(&conn, account_id, "INBOX", false).unwrap();
+        let folders = list(&conn, account_id).unwrap();
+        assert!(!folders.iter().find(|f| f.name == "INBOX").unwrap().selected);
+    }
+
+    #[test]
+    fn selected_names_returns_only_selected_folders_for_the_account() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations_for_test(&conn);
+        let a1 = setup_account(&conn);
+        let a2 = setup_account(&conn);
+
+        get_or_create(&conn, a1, "INBOX").unwrap(); // selected by default
+        get_or_create(&conn, a1, "Archive").unwrap(); // unselected by default
+        set_selected(&conn, a1, "Archive", true).unwrap();
+        get_or_create(&conn, a1, "Spam").unwrap(); // left unselected
+        get_or_create(&conn, a2, "INBOX").unwrap();
+
+        let names = selected_names(&conn, a1).unwrap();
+        assert_eq!(names, vec!["Archive".to_string(), "INBOX".to_string()]);
     }
 }

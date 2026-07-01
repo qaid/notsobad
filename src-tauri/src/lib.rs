@@ -27,6 +27,7 @@ pub fn run() {
             commands::list_accounts,
             commands::sync_account,
             commands::list_folders,
+            commands::set_folder_selected,
             commands::list_inbox,
             commands::list_folder_messages,
             commands::thread_messages,

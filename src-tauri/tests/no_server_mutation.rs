@@ -162,6 +162,71 @@ fn list_folders_is_read_only() {
     assert_eq!(folders, vec!["INBOX".to_string()], "expected the fake LIST response's one folder");
 }
 
+/// #14 rework: `sync_account` now opens ONE IMAP session and reuses it across
+/// discovery (`LIST`) plus a loop of per-folder syncs (`sync_inbox_with`),
+/// closing with a single `LOGOUT` at the end — see
+/// `connection::sync::connect_and_list_folders` and its caller in
+/// `commands::sync_account`. The pre-existing guardrail tests above only ever
+/// drive `sync_inbox_with` once, in isolation, on a session that test itself
+/// set up — nothing exercised the real reused-session, multiple-folder
+/// sequence. This test does.
+///
+/// It can't call `connect_and_list_folders` directly: that function calls
+/// `connect_and_login`, which hardcodes a TLS handshake, so it can't be
+/// driven over this test's plaintext recording socket. Every existing test in
+/// this file works around the same constraint by driving the generic,
+/// transport-agnostic halves (`list_folders_with`, `sync_inbox_with`)
+/// directly over a plaintext `imap::Client` login — that IS the logic inside
+/// `connect_and_list_folders` / `sync_account`'s loop, just assembled here
+/// instead of through the TLS-only wrapper. This test assembles them the same
+/// way `sync_account` does: one login, one `list_folders_with` call, then
+/// `sync_inbox_with` looped over two distinct folder names on that same
+/// session, then one `logout`.
+#[test]
+fn multi_folder_sync_on_one_session_is_read_only() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = channel::<String>();
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_imap(stream, tx);
+    });
+
+    let client = imap::Client::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+    let mut session = client.login("user", "pass").map_err(|(e, _)| e).unwrap();
+
+    // Mirrors connect_and_list_folders's discovery half.
+    let _ = notsobad_lib::connection::list_folders_with(&mut session).unwrap();
+
+    // Mirrors sync_account's loop: reuse the SAME session across every
+    // selected folder, never reconnecting between them.
+    for folder in ["INBOX", "Archive"] {
+        notsobad_lib::connection::sync_inbox_with(&mut session, folder, None, 0).unwrap();
+    }
+
+    let _ = session.logout();
+    server.join().unwrap();
+
+    let verbs: Vec<String> = rx.try_iter().collect();
+    for v in &verbs {
+        assert!(
+            IMAP_ALLOW.contains(&v.as_str()),
+            "non-allowlisted IMAP verb sent during multi-folder sync: {v} (all: {verbs:?})"
+        );
+    }
+    assert!(!verbs.contains(&"SELECT".to_string()), "must never SELECT, got: {verbs:?}");
+    assert!(verbs.contains(&"LIST".to_string()), "expected LIST (discovery), got: {verbs:?}");
+    // verb() collapses "EXAMINE INBOX" and "EXAMINE Archive" to the same
+    // token, so per-folder EXAMINE is proven by count, not by name: two
+    // EXAMINEs on one reused session means both loop iterations actually ran
+    // sync against the server, not just the first.
+    let examine_count = verbs.iter().filter(|v| v.as_str() == "EXAMINE").count();
+    assert_eq!(examine_count, 2, "expected EXAMINE for both folders, got: {verbs:?}");
+    let logout_count = verbs.iter().filter(|v| v.as_str() == "LOGOUT").count();
+    assert_eq!(logout_count, 1, "expected exactly one LOGOUT for the whole reused session, got: {verbs:?}");
+}
+
 #[test]
 fn smtp_validation_does_not_send() {
     use lettre::transport::smtp::SmtpTransport;

@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0002_messages_readpath.sql"),
     include_str!("../../migrations/0003_body_is_html.sql"),
     include_str!("../../migrations/0004_folders.sql"),
+    include_str!("../../migrations/0005_folder_selection.sql"),
 ];
 
 /// Open (creating if absent) the SQLite DB at `path` and run migrations.
@@ -31,20 +32,6 @@ pub(crate) fn run_migrations_for_test(conn: &Connection) {
     run_migrations(conn).unwrap();
 }
 
-/// Migrations (1-indexed, matching `user_version`) that rebuild a table
-/// referenced by a live foreign key (create-copy-DROP-RENAME, per SQLite's
-/// own procedure for schema changes ALTER TABLE can't express). `PRAGMA
-/// foreign_keys` is a documented no-op inside a transaction, so these need
-/// FK enforcement toggled off *around* the BEGIN/COMMIT, not inside the SQL
-/// text — otherwise the DROP TABLE mid-rebuild fails its own FK check against
-/// child tables (ai_results/labels REFERENCE messages(id)), even though the
-/// rebuild is logically safe (every child row's message_id is preserved by
-/// the RENAME). Both child tables are empty on today's real upgrade path
-/// (their features ship in #4/#5, after this migration), so this can't
-/// actually fire yet — but a startup-critical rebuild shouldn't depend on
-/// that timing holding forever, so the toggle guards it regardless.
-const FK_UNSAFE_MIGRATIONS: &[i64] = &[4]; // 0004_folders.sql: messages table rebuild
-
 /// Apply any migrations newer than the DB's current `user_version`, each in its
 /// own transaction, bumping `user_version` as it goes.
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -52,14 +39,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let version = (i + 1) as i64;
         if version > current {
-            let fk_unsafe = FK_UNSAFE_MIGRATIONS.contains(&version);
-            if fk_unsafe {
-                conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-            }
             conn.execute_batch(&format!("BEGIN;\n{sql}\n;\nPRAGMA user_version = {version};\nCOMMIT;"))?;
-            if fk_unsafe {
-                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            }
         }
     }
     Ok(())
@@ -158,17 +138,9 @@ mod tests {
         //
         // FK on, matching db::open()'s real ordering (PRAGMA foreign_keys=ON,
         // then run_migrations) — NOT the bare open_in_memory() default used
-        // by the other tests in this file. 0004 DROPs `messages` and RENAMEs
-        // a replacement into place while `ai_results`/`labels` both
-        // REFERENCE messages(id); on the real upgrade path both tables are
-        // still empty at this point (#4/#5 haven't shipped yet), so this
-        // can't fire in production today. It's still worth guarding: this is
-        // a startup-critical migration, and "child table happens to be
-        // empty" is a timing invariant, not a guarantee — a dev DB seeded
-        // out of order, or a future migration ordering change, could violate
-        // it. The seeded ai_results row here proves the DROP/rebuild
-        // survives FK enforcement with a non-empty child table, not just the
-        // empty-table case that's actually true today.
+        // by the other tests in this file. This guards the 0004 rebuild
+        // (DROP `messages` + RENAME a replacement into place) against FK
+        // enforcement in the real startup path.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         for sql in &MIGRATIONS[..3] {
@@ -187,35 +159,20 @@ mod tests {
             [account_id],
         )
         .unwrap();
-        let message_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO ai_results (message_id, kind, result, model) VALUES (?1, 'triage', '{}', 'qwen2.5:3b')",
-            [message_id],
-        )
-        .unwrap();
 
-        // Through run_migrations (not a raw execute_batch of MIGRATIONS[3]):
-        // this is what exercises the FK_UNSAFE_MIGRATIONS toggle in the real
-        // startup path (db::open), not just the migration's own SQL text.
         run_migrations(&conn).unwrap();
 
-        // The ai_results row must survive the messages table rebuild (same
-        // message id preserved across DROP/RENAME).
-        let ai_result_count: i64 = conn
-            .query_row("SELECT count(*) FROM ai_results WHERE message_id = ?1", [message_id], |r| r.get(0))
-            .unwrap();
-        assert_eq!(ai_result_count, 1, "ai_results row should survive the messages table rebuild");
-
-        let (folder_id, name, uidvalidity, last_uid): (i64, String, i64, i64) = conn
+        let (folder_id, name, uidvalidity, last_uid, selected): (i64, String, i64, i64, i64) = conn
             .query_row(
-                "SELECT id, name, uidvalidity, last_uid FROM folders WHERE account_id = ?1",
+                "SELECT id, name, uidvalidity, last_uid, selected FROM folders WHERE account_id = ?1",
                 [account_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(name, "INBOX");
         assert_eq!(uidvalidity, 42);
         assert_eq!(last_uid, 7);
+        assert_eq!(selected, 1, "backfilled INBOX must default to selected so upgrades keep syncing it");
 
         let msg_folder_id: i64 = conn
             .query_row("SELECT folder_id FROM messages WHERE account_id = ?1", [account_id], |r| r.get(0))

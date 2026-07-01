@@ -27,6 +27,10 @@ export const syncAccount = (accountId: number) =>
 export const listFolders = (accountId: number) =>
   invoke<Folder[]>("list_folders", { accountId });
 
+// Toggle a folder's opt-in sync selection. Pure SQLite write, no IMAP traffic.
+export const setFolderSelected = (accountId: number, folderName: string, selected: boolean) =>
+  invoke<void>("set_folder_selected", { accountId, folderName, selected });
+
 // Inbox list: one row per thread, newest first, INBOX only. Pass null/undefined for accountId to span all accounts.
 export const listInbox = (accountId?: number) =>
   invoke<MessageSummary[]>("list_inbox", { accountId: accountId ?? null });

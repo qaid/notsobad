@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app, selectFolder, syncAndRefresh } from "../store.svelte";
+  import { app, selectFolder, selectUnifiedInbox, syncAndRefresh, toggleFolderSelected } from "../store.svelte";
 
   let syncing = $state<number | null>(null);
 
@@ -12,15 +12,33 @@
     }
   }
 
+  // Account-scoped: currentFolder is always {accountId, name} for a specific
+  // folder selection (see store.svelte's doc comment), so this can tell one
+  // account's INBOX from another's — previously `name === "INBOX" ->
+  // app.currentFolder === null` ignored accountId entirely and highlighted
+  // every account's INBOX row at once. Since currentFolder is only ever null
+  // when the unified view is active (never as a stand-in for "this
+  // account's INBOX"), no account's INBOX row can highlight while the
+  // unified view is selected, and vice versa.
   function isCurrent(accountId: number, name: string) {
-    return name === "INBOX"
-      ? app.currentFolder === null
-      : app.currentFolder?.accountId === accountId && app.currentFolder?.name === name;
+    return app.currentFolder?.accountId === accountId && app.currentFolder?.name === name;
+  }
+
+  function isUnifiedCurrent() {
+    return app.currentFolder === null;
+  }
+
+  function toggleSelected(accountId: number, name: string, event: Event) {
+    const checked = (event.currentTarget as HTMLInputElement).checked;
+    void toggleFolderSelected(accountId, name, checked);
   }
 </script>
 
 <aside class="sidebar">
   <button class="add" onclick={() => (app.showWizard = true)}>+ Add account</button>
+  <button class="unified" class:current={isUnifiedCurrent()} onclick={() => selectUnifiedInbox()}>
+    All Inboxes
+  </button>
   <ul>
     {#each app.accounts as acct (acct.id)}
       <li>
@@ -36,7 +54,14 @@
         {#if app.folders[acct.id]?.length}
           <ul class="folders">
             {#each app.folders[acct.id] as folder (folder.id)}
-              <li>
+              <li class="folder-row">
+                <input
+                  type="checkbox"
+                  class="folder-toggle"
+                  checked={folder.selected}
+                  title={folder.selected ? "Synced — uncheck to stop syncing" : "Not synced — check to sync"}
+                  onchange={(e) => toggleSelected(acct.id, folder.name, e)}
+                />
                 <button
                   class="folder"
                   class:current={isCurrent(acct.id, folder.name)}
@@ -68,6 +93,22 @@
   .add {
     padding: 8px;
     cursor: pointer;
+  }
+  .unified {
+    text-align: left;
+    padding: 8px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font: inherit;
+    border-radius: 6px;
+  }
+  .unified:hover {
+    background: rgba(0, 0, 0, 0.05);
+  }
+  .unified.current {
+    font-weight: 600;
+    background: rgba(0, 0, 0, 0.05);
   }
   ul {
     list-style: none;
@@ -113,10 +154,20 @@
   .folders li {
     padding: 0;
   }
+  .folder-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding-left: 8px;
+  }
+  .folder-toggle {
+    flex-shrink: 0;
+    cursor: pointer;
+  }
   .folder {
-    width: 100%;
+    flex: 1;
     text-align: left;
-    padding: 3px 8px 3px 16px;
+    padding: 3px 8px 3px 8px;
     border: none;
     background: none;
     cursor: pointer;

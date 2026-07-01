@@ -100,8 +100,8 @@ fn connect_and_examine(
 }
 
 /// Enumerate this account's IMAP folders via `LIST "" "*"` (read-only, ADR
-/// 0003 — LIST never mutates the server). Used by the folder picker and by
-/// "sync all folders" to discover what's there.
+/// 0003 — LIST never mutates the server). Used by the folder picker to
+/// discover what's there.
 pub fn list_folders(cfg: &AccountConfig, app_password: &str) -> Result<Vec<String>, String> {
     let mut session = connect_and_login(cfg, app_password)?;
     let folders = list_folders_with(&mut session)?;
@@ -123,18 +123,21 @@ pub fn list_folders_with<T: Read + Write>(session: &mut imap::Session<T>) -> Res
         .collect())
 }
 
-/// Sync one folder: full mirror for the last 6 months, metadata-only further
-/// back. `prior_uidvalidity`/`prior_last_uid` come from `folders` and drive
-/// the incremental fetch; pass `prior_last_uid = 0` for a first sync.
-pub fn sync_inbox(
+/// Discover all folders via one `LIST`, keeping the session open so the
+/// caller can sync a subset of them afterward without reconnecting. Returns
+/// the still-open session plus the discovered names.
+///
+/// Split from folder sync (rather than one do-everything call) because
+/// deciding WHICH discovered folders to actually sync depends on the
+/// `selected` flags in SQLite (#14 rework: opt-in per folder) — that lookup
+/// happens on the async/DB side, between this call and `sync_folders_with`.
+pub fn connect_and_list_folders(
     cfg: &AccountConfig,
     app_password: &str,
-    folder: &str,
-    prior_uidvalidity: Option<u32>,
-    prior_last_uid: u32,
-) -> Result<SyncResult, String> {
-    let mut session = connect_and_examine(cfg, app_password, folder)?;
-    sync_inbox_with(&mut session, folder, prior_uidvalidity, prior_last_uid)
+) -> Result<(imap::Session<native_tls::TlsStream<TcpStream>>, Vec<String>), String> {
+    let mut session = connect_and_login(cfg, app_password)?;
+    let folders = list_folders_with(&mut session)?;
+    Ok((session, folders))
 }
 
 /// The sync logic, generic over the transport so the guardrail test can drive
@@ -201,7 +204,6 @@ pub fn sync_inbox_with<T: Read + Write>(
         }
     }
 
-    let _ = session.logout();
     Ok(SyncResult { messages, uidvalidity, max_uid, uid_validity_changed })
 }
 
