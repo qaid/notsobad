@@ -59,6 +59,11 @@ export async function selectFolder(accountId: number, name: string) {
   // See the `currentFolder` doc comment: a bare "INBOX -> null" sentinel
   // can't distinguish which account's INBOX is selected.
   app.currentFolder = { accountId, name };
+  // Close any open thread: +page.svelte gates the content pane on
+  // currentThread, so without this a folder click updates app.inbox behind
+  // a still-showing ThreadReader and looks like the sidebar is dead until
+  // you hit the reader's back button.
+  app.currentThread = null;
   await refreshInbox();
 }
 
@@ -66,6 +71,9 @@ export async function selectFolder(accountId: number, name: string) {
 // Inboxes" view). Wired to the sidebar's "All Inboxes" row.
 export async function selectUnifiedInbox() {
   app.currentFolder = null;
+  // Same reason as selectFolder: drop out of the thread reader so the
+  // unified inbox actually shows when picked.
+  app.currentThread = null;
   await refreshInbox();
 }
 

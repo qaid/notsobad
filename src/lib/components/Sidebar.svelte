@@ -107,8 +107,8 @@
     background: rgba(0, 0, 0, 0.05);
   }
   .unified.current {
-    font-weight: 600;
-    background: rgba(0, 0, 0, 0.05);
+    font-weight: 700;
+    background: rgba(0, 0, 0, 0.12);
   }
   ul {
     list-style: none;
@@ -179,8 +179,16 @@
   .folder:hover {
     background: rgba(0, 0, 0, 0.05);
   }
+  /* "Currently showing" state: a filled row background + bold, deliberately
+     stronger than hover and visually distinct from the sync checkbox — the
+     checkbox means "sync this folder", this fill means "this folder's mail is
+     in the content pane right now". */
   .folder.current {
-    font-weight: 600;
+    font-weight: 700;
     opacity: 1;
+    background: rgba(0, 0, 0, 0.12);
+  }
+  .folder.current:hover {
+    background: rgba(0, 0, 0, 0.12);
   }
 </style>
