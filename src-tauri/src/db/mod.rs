@@ -3,11 +3,16 @@ use rusqlite::Connection;
 use std::path::Path;
 
 pub mod accounts;
+pub mod messages;
 
 /// Ordered migrations. Index + 1 == the schema version it produces.
 /// ponytail: a plain array of embedded SQL + user_version. Add a migration
 /// framework only if down-migrations or branching schema history ever matter.
-const MIGRATIONS: &[&str] = &[include_str!("../../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../migrations/0001_init.sql"),
+    include_str!("../../migrations/0002_messages_readpath.sql"),
+    include_str!("../../migrations/0003_body_is_html.sql"),
+];
 
 /// Open (creating if absent) the SQLite DB at `path` and run migrations.
 pub fn open(path: &Path) -> Result<Connection> {
@@ -54,6 +59,37 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(n, 1, "table {t} missing");
+        }
+    }
+
+    #[test]
+    fn readpath_migration_adds_expected_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        for col in [
+            "subject", "from_addr", "from_name", "seen", "in_reply_to", "refs", "thread_id",
+            "snippet", "attachments", "body_is_html",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('messages') WHERE name=?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "messages.{col} missing");
+        }
+
+        for col in ["uidvalidity", "last_uid"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('accounts') WHERE name=?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "accounts.{col} missing");
         }
     }
 }

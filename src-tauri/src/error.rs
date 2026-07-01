@@ -13,9 +13,7 @@ pub enum AppError {
     #[error("keychain error: {0}")]
     Keychain(#[from] keyring::Error),
 
-    // Used by the connection layer's typed errors in #3 (sync path).
     #[error("IMAP connection failed: {0}")]
-    #[allow(dead_code)]
     Imap(String),
 
     #[error("SMTP connection failed: {0}")]

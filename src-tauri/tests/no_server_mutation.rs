@@ -1,26 +1,50 @@
 //! Guardrail (ADR 0003, CLAUDE.md's highest-value test): connection validation
-//! must issue ZERO server-mutating commands. We drive the real client logic over
-//! plaintext recording sockets and assert on the verbs the client actually sent.
+//! AND sync must issue ZERO server-mutating commands. We drive the real client
+//! logic over plaintext recording sockets and assert on the verbs the client
+//! actually sent.
 //!
-//! Scope note: the IMAP half guards OUR logic (EXAMINE, not SELECT — our choice).
-//! The SMTP half mostly characterizes lettre, but is kept as regression coverage
-//! for when #3/#5 route real send/sync traffic through the same harness.
+//! Scope note: the IMAP half guards OUR logic (EXAMINE, not SELECT — our choice;
+//! BODY.PEEK[...], not bare BODY[...], which would set \Seen server-side). The
+//! SMTP half mostly characterizes lettre, but is kept as regression coverage for
+//! when #5 routes real send traffic through the same harness.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
-// Commands that mutate a mailbox or begin a send. None may appear during validation.
-const IMAP_DENY: &[&str] = &[
-    "STORE", "MOVE", "EXPUNGE", "APPEND", "CREATE", "DELETE", "RENAME", "COPY", "SUBSCRIBE",
-    "SETACL", "SELECT", // SELECT opens read-write; we require EXAMINE instead.
-];
+// IMAP: allowlist, not denylist. A denylist of single-word mutating verbs
+// (STORE, COPY, MOVE...) misses their `UID <verb>` two-word forms, which is
+// exactly how real clients send UID-scoped mutations on the wire — a future
+// `uid_store`/`uid_copy`/`uid_move` call would slip through undetected. An
+// allowlist of the exact verbs our read-only paths are permitted to send
+// fails closed instead: anything new must be added here deliberately.
+const IMAP_ALLOW: &[&str] =
+    &["LOGIN", "CAPABILITY", "EXAMINE", "UID SEARCH", "UID FETCH", "LOGOUT"];
 const SMTP_DENY: &[&str] = &["MAIL", "RCPT", "DATA"];
 
-/// First whitespace-delimited token, uppercased — the protocol verb.
+/// First whitespace-delimited token, uppercased — the protocol verb. For a
+/// `UID <verb> ...` command (e.g. `UID FETCH`, `UID SEARCH`), returns the
+/// two-word form so positive assertions can tell FETCH from SEARCH.
 fn verb(line: &str) -> String {
-    line.split_whitespace().next().unwrap_or("").to_uppercase()
+    let mut parts = line.split_whitespace();
+    let first = parts.next().unwrap_or("").to_uppercase();
+    if first == "UID" {
+        if let Some(second) = parts.next() {
+            return format!("UID {}", second.to_uppercase());
+        }
+    }
+    first
+}
+
+/// Locks in the fail-closed property itself: a careless future edit that adds
+/// a mutating verb (including a UID two-word form) to IMAP_ALLOW should fail
+/// this test, not just silently widen what the allowlist accepts.
+#[test]
+fn allowlist_excludes_known_mutations() {
+    for m in ["UID STORE", "UID COPY", "UID MOVE", "STORE", "COPY", "MOVE", "EXPUNGE", "APPEND", "SELECT"] {
+        assert!(!IMAP_ALLOW.contains(&m), "{m} must never be allowlisted (ADR 0003)");
+    }
 }
 
 #[test]
@@ -43,9 +67,35 @@ fn imap_validation_is_read_only() {
 
     let verbs: Vec<String> = rx.try_iter().collect();
     for v in &verbs {
-        assert!(!IMAP_DENY.contains(&v.as_str()), "mutating IMAP verb sent: {v} (all: {verbs:?})");
+        assert!(IMAP_ALLOW.contains(&v.as_str()), "non-allowlisted IMAP verb sent: {v} (all: {verbs:?})");
     }
     assert!(verbs.contains(&"EXAMINE".to_string()), "expected EXAMINE, got: {verbs:?}");
+}
+
+#[test]
+fn sync_is_read_only() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = channel::<String>();
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_imap(stream, tx);
+    });
+
+    let client = imap::Client::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+    let mut session = client.login("user", "pass").map_err(|(e, _)| e).unwrap();
+    notsobad_lib::connection::sync_inbox_with(&mut session, None, 0).unwrap();
+    drop(session);
+    server.join().unwrap();
+
+    let verbs: Vec<String> = rx.try_iter().collect();
+    for v in &verbs {
+        assert!(IMAP_ALLOW.contains(&v.as_str()), "non-allowlisted IMAP verb sent during sync: {v} (all: {verbs:?})");
+    }
+    assert!(verbs.contains(&"EXAMINE".to_string()), "expected EXAMINE, got: {verbs:?}");
+    assert!(verbs.contains(&"UID SEARCH".to_string()), "expected UID SEARCH, got: {verbs:?}");
+    assert!(verbs.contains(&"UID FETCH".to_string()), "expected UID FETCH, got: {verbs:?}");
 }
 
 #[test]
@@ -113,9 +163,16 @@ fn serve_imap(stream: TcpStream, tx: Sender<String>) {
         tx.send(v.clone()).unwrap();
 
         if v == "EXAMINE" {
-            w.write_all(b"* 0 EXISTS\r\n* OK [READ-ONLY] examined\r\n").unwrap();
+            w.write_all(b"* 0 EXISTS\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* OK [READ-ONLY] examined\r\n").unwrap();
         } else if v == "CAPABILITY" {
             w.write_all(b"* CAPABILITY IMAP4rev1\r\n").unwrap();
+        } else if v == "UID SEARCH" {
+            // Report one fake message (UID 1) so the client's FETCH actually fires.
+            w.write_all(b"* SEARCH 1\r\n").unwrap();
+        } else if v == "UID FETCH" {
+            // Minimal FETCH response for UID 1: a zero-byte literal is a valid,
+            // parseable empty body/header.
+            w.write_all(b"* 1 FETCH (UID 1 FLAGS () BODY[] {0}\r\n)\r\n").unwrap();
         }
         w.write_all(format!("{tag} OK {v} done\r\n").as_bytes()).unwrap();
 

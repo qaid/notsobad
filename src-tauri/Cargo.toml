@@ -28,6 +28,7 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 imap = "2"
 native-tls = "0.2"
 thiserror = "2"
+mail-parser = "0.11"
 
 [dev-dependencies]
 # in-process recording IMAP/SMTP server for the no-server-mutation guardrail test

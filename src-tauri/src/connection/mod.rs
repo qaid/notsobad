@@ -12,11 +12,14 @@
 
 mod imap;
 mod smtp;
+pub mod sync;
 
 // Exposed for the no-server-mutation guardrail test (tests/no_server_mutation.rs),
 // which drives the real read-only IMAP sequence over a plaintext recording socket.
 #[doc(hidden)]
 pub use imap::run_readonly_checks;
+#[doc(hidden)]
+pub use sync::sync_inbox_with;
 
 use serde::{Deserialize, Serialize};
 

@@ -1,9 +1,4 @@
-use std::net::TcpStream;
-use std::time::Duration;
 use super::AccountConfig;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Validate an IMAP login WITHOUT mutating the mailbox.
 ///
@@ -12,40 +7,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// EXPUNGE, or set flags (ADR 0003). Returns Err with a non-secret message on
 /// failure — never echoes the password.
 ///
-/// Uses an explicit connect timeout (15 s) and read/write timeout (30 s) to
-/// avoid hanging indefinitely on an unreachable host.
+/// The DNS/TCP/TLS/LOGIN sequence (with connect + I/O timeouts) lives in
+/// `sync::connect_and_login`, shared with the sync module so connection
+/// hardening (timeouts, TLS, future STARTTLS/OAuth) only lives in one place.
 pub fn validate(cfg: &AccountConfig, app_password: &str) -> Result<(), String> {
-    use std::net::ToSocketAddrs;
-
-    let addr = (cfg.imap_host.as_str(), cfg.imap_port)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS lookup for {} failed: {e}", cfg.imap_host))?
-        .next()
-        .ok_or_else(|| format!("no address for {}", cfg.imap_host))?;
-
-    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("TCP connect to {} failed: {e}", cfg.imap_host))?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT))
-        .map_err(|e| format!("set_read_timeout failed: {e}"))?;
-    tcp.set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|e| format!("set_write_timeout failed: {e}"))?;
-
-    let tls_connector = native_tls::TlsConnector::builder()
-        .build()
-        .map_err(|e| format!("TLS setup failed: {e}"))?;
-    let tls_stream = tls_connector
-        .connect(&cfg.imap_host, tcp)
-        .map_err(|e| format!("TLS handshake with {} failed: {e}", cfg.imap_host))?;
-
-    // Build a Client from the already-connected TLS stream. The imap crate's
-    // Client::new reads the server greeting; login() then sends LOGIN.
-    let client = imap::Client::new(tls_stream);
-
-    let mut session = client
-        .login(&cfg.username, app_password)
-        // .login returns (err, client) on failure; keep only the error text.
-        .map_err(|(e, _client)| format!("login failed: {e}"))?;
-
+    let mut session = super::sync::connect_and_login(cfg, app_password)?;
     run_readonly_checks(&mut session)
 }
 
