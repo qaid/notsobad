@@ -92,6 +92,21 @@ pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<Account>> {
 /// read AFTER this call's own discovery has upserted newly-seen folders, or a
 /// brand-new account's just-discovered INBOX would default to selected in
 /// SQLite but never get synced on this same call.
+///
+/// Matches `selected` (persisted in SQLite, can outlive a folder's presence
+/// on the server) against `ids_by_name` (this call's fresh `LIST` results).
+/// A folder can be selected from a past sync yet absent from a later LIST —
+/// deleted, renamed, or flipped `\Noselect` server-side — since discovery
+/// only ever inserts folder rows, it never prunes stale selections. Skips
+/// rather than indexes, so a vanished folder can't panic; a bare `map[&name]`
+/// index panic here would poison `state.db`'s mutex for the rest of the
+/// app's lifetime, not just fail this one sync.
+fn selected_present_in_listing(
+    ids_by_name: &std::collections::HashMap<String, i64>,
+    selected: Vec<String>,
+) -> Vec<(String, i64)> {
+    selected.into_iter().filter_map(|name| ids_by_name.get(&name).map(|&id| (name, id))).collect()
+}
 #[tauri::command]
 pub async fn sync_account(state: State<'_, AppState>, account_id: i64) -> Result<usize> {
     let cfg = {
@@ -120,13 +135,9 @@ pub async fn sync_account(state: State<'_, AppState>, account_id: i64) -> Result
         // brand-new account's just-discovered (and default-selected) INBOX
         // is syncable in this same call, not just from the next one.
         let selected = db::folders::selected_names(&conn, account_id)?;
-        selected
+        selected_present_in_listing(&ids_by_name, selected)
             .into_iter()
-            .map(|name| {
-                // Every selected folder was just upserted above (selection
-                // only ever points at rows `get_or_create` has already
-                // created), so this lookup can't miss.
-                let folder_id = ids_by_name[&name];
+            .map(|(name, folder_id)| {
                 let (uidvalidity, last_uid) = db::folders::uid_state(&conn, folder_id)?;
                 Ok((name, folder_id, uidvalidity, last_uid))
             })
@@ -284,4 +295,40 @@ pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result
         },
     )?;
     Ok(MessageBody { body: fetched.body, body_is_html })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_present_in_listing;
+    use std::collections::HashMap;
+
+    #[test]
+    fn drops_a_selected_folder_no_longer_in_the_listing() {
+        let mut ids_by_name = HashMap::new();
+        ids_by_name.insert("INBOX".to_string(), 1);
+        ids_by_name.insert("Archive".to_string(), 2);
+
+        // "Deleted" is selected in SQLite from a past sync but this call's
+        // LIST no longer reports it (removed/renamed/\Noselect server-side).
+        let selected =
+            vec!["INBOX".to_string(), "Archive".to_string(), "Deleted".to_string()];
+
+        let result = selected_present_in_listing(&ids_by_name, selected);
+
+        assert_eq!(
+            result,
+            vec![("INBOX".to_string(), 1), ("Archive".to_string(), 2)],
+            "must silently drop the vanished folder, not panic"
+        );
+    }
+
+    #[test]
+    fn keeps_every_selected_folder_still_listed() {
+        let mut ids_by_name = HashMap::new();
+        ids_by_name.insert("INBOX".to_string(), 1);
+
+        let result = selected_present_in_listing(&ids_by_name, vec!["INBOX".to_string()]);
+
+        assert_eq!(result, vec![("INBOX".to_string(), 1)]);
+    }
 }
