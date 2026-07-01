@@ -41,6 +41,7 @@ export type MessageDetail = {
   subject: string | null;
   headers: string;
   body: string | null;
+  body_is_html: boolean;
   received_at: string | null;
   seen: boolean;
   mirror_state: "full" | "meta_only";

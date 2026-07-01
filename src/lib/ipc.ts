@@ -26,9 +26,10 @@ export const syncAccount = (accountId: number) =>
 export const listInbox = (accountId?: number) =>
   invoke<MessageSummary[]>("list_inbox", { accountId: accountId ?? null });
 
-export const threadMessages = (threadId: string) =>
-  invoke<MessageDetail[]>("thread_messages", { threadId });
+export const threadMessages = (accountId: number, threadId: string) =>
+  invoke<MessageDetail[]>("thread_messages", { accountId, threadId });
 
 // Lazily fetches the body from the server if this is a metadata-only message.
+// body_is_html is the backend's own parser signal, not a frontend guess.
 export const messageBody = (messageId: number) =>
-  invoke<string>("message_body", { messageId });
+  invoke<{ body: string; body_is_html: boolean }>("message_body", { messageId });

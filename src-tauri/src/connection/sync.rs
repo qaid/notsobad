@@ -37,6 +37,7 @@ pub struct FetchedMessage {
     pub seen: bool,
     pub headers_raw: String,
     pub body: Option<String>,   // None for metadata-only rows
+    pub body_is_html: bool,     // parser's own html-vs-text answer, not a frontend guess
     pub snippet: Option<String>,
     pub attachments: Vec<AttachmentMeta>,
     pub mirror_state: &'static str, // "full" | "meta_only"
@@ -52,8 +53,11 @@ pub struct SyncResult {
     pub uid_validity_changed: bool,
 }
 
-/// Connect, log in, and EXAMINE INBOX (read-only). Shared by validate() and sync.
-fn connect_and_examine(
+/// DNS lookup, TCP connect (with timeout), TLS handshake, and LOGIN. Shared by
+/// `imap::validate` and sync so this connection-hardening sequence (timeouts,
+/// TLS, credential handling) lives in exactly one place. Does NOT open a
+/// mailbox: callers EXAMINE (or run their own read-only checks) afterward.
+pub(super) fn connect_and_login(
     cfg: &AccountConfig,
     app_password: &str,
 ) -> Result<imap::Session<native_tls::TlsStream<TcpStream>>, String> {
@@ -78,10 +82,15 @@ fn connect_and_examine(
         .map_err(|e| format!("TLS handshake with {} failed: {e}", cfg.imap_host))?;
 
     let client = imap::Client::new(tls_stream);
-    let mut session = client
-        .login(&cfg.username, app_password)
-        .map_err(|(e, _client)| format!("login failed: {e}"))?;
+    client.login(&cfg.username, app_password).map_err(|(e, _client)| format!("login failed: {e}"))
+}
 
+/// Connect, log in, and EXAMINE INBOX (read-only). Used by sync's entry point.
+fn connect_and_examine(
+    cfg: &AccountConfig,
+    app_password: &str,
+) -> Result<imap::Session<native_tls::TlsStream<TcpStream>>, String> {
+    let mut session = connect_and_login(cfg, app_password)?;
     session.examine("INBOX").map_err(|e| format!("examine INBOX failed: {e}"))?;
     Ok(session)
 }
@@ -152,6 +161,7 @@ pub fn sync_inbox_with<T: Read + Write>(
                 .map_err(|e| format!("uid fetch failed: {e}"))?;
             for f in fetches.iter() {
                 if let Some(uid) = f.uid {
+                    max_uid = max_uid.max(uid);
                     let seen = f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen));
                     if let Some(raw) = f.header() {
                         messages.push(parse_meta(uid, seen, raw));
@@ -165,8 +175,24 @@ pub fn sync_inbox_with<T: Read + Write>(
     Ok(SyncResult { messages, uidvalidity, max_uid, uid_validity_changed })
 }
 
+/// Result of an on-demand body fetch: the body plus whatever else the same
+/// parse produced for free (snippet, attachments, html-vs-text), so opening a
+/// metadata-only message doesn't leave those columns permanently empty.
+pub struct FetchedBody {
+    pub body: String,
+    pub body_is_html: bool,
+    pub snippet: Option<String>,
+    pub attachments: Vec<AttachmentMeta>,
+}
+
 /// Fetch a single message's full body on demand (older meta-only message opened).
-pub fn fetch_body(cfg: &AccountConfig, app_password: &str, uid: u32) -> Result<String, String> {
+///
+/// A message that legitimately parses to an empty body (e.g. an
+/// attachment-only or header-only message) returns `Ok` with an empty `body`,
+/// not `Err` — the caller can't tell "genuinely empty" from "fetch failed"
+/// from an error alone, and the frontend treats a thrown error and an empty
+/// string differently (see ThreadReader's loadBody).
+pub fn fetch_body(cfg: &AccountConfig, app_password: &str, uid: u32) -> Result<FetchedBody, String> {
     let mut session = connect_and_examine(cfg, app_password)?;
     let fetches = session
         .uid_fetch(uid.to_string(), "BODY.PEEK[]")
@@ -177,7 +203,12 @@ pub fn fetch_body(cfg: &AccountConfig, app_password: &str, uid: u32) -> Result<S
         .ok_or_else(|| format!("no body returned for uid {uid}"))?;
     let parsed = parse_full(uid, true, raw);
     let _ = session.logout();
-    parsed.body.ok_or_else(|| "message body could not be parsed".to_string())
+    Ok(FetchedBody {
+        body: parsed.body.unwrap_or_default(),
+        body_is_html: parsed.body_is_html,
+        snippet: parsed.snippet,
+        attachments: parsed.attachments,
+    })
 }
 
 fn uid_list(uids: &std::collections::HashSet<u32>) -> String {
@@ -217,9 +248,24 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 fn parse_full(uid: u32, seen: bool, raw: &[u8]) -> FetchedMessage {
-    let mut m = parse_common(uid, seen, raw, "full");
-    if let Some(parsed) = MessageParser::default().parse(raw) {
+    // Parse the whole message once. `headers_raw` must be ONLY the header
+    // block: slicing to root_part().offset_body (headers+body boundary,
+    // computed by the parser itself) avoids storing the entire message
+    // (headers+body+attachments) into the `headers` column, which doubled
+    // storage per full-mirror message and lossy-mangled binary attachment
+    // bytes through String::from_utf8_lossy against a text column.
+    let full = MessageParser::default().parse(raw);
+    let header_bytes = match &full {
+        Some(p) => {
+            let end = p.root_part().offset_body as usize;
+            &raw[..end.min(raw.len())]
+        }
+        None => raw,
+    };
+    let mut m = parse_common(uid, seen, header_bytes, "full");
+    if let Some(parsed) = full {
         m.snippet = parsed.body_preview(200).map(|c| c.into_owned());
+        m.body_is_html = parsed.body_html(0).is_some();
         m.body = parsed
             .body_html(0)
             .or_else(|| parsed.body_text(0))
@@ -289,6 +335,7 @@ fn parse_common(uid: u32, seen: bool, raw: &[u8], mirror_state: &'static str) ->
         seen,
         headers_raw,
         body: None,
+        body_is_html: false,
         snippet: None,
         attachments: Vec::new(),
         mirror_state,
@@ -369,5 +416,16 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(meta.mirror_state, "meta_only");
         assert!(meta.body.is_none());
         assert_eq!(meta.subject.as_deref(), Some("Réunion"));
+    }
+
+    #[test]
+    fn full_mirror_headers_column_excludes_body() {
+        // headers_raw must be ONLY the header block, not the whole message —
+        // otherwise a full-mirror row doubles its storage (body stored twice)
+        // and binary attachment bytes get lossy-mangled into a text column.
+        let reply = parse_full(2, true, REPLY);
+        assert!(!reply.headers_raw.contains("html part"));
+        assert!(!reply.headers_raw.contains("plain part"));
+        assert!(reply.headers_raw.contains("Message-ID: <reply@x.example>"));
     }
 }

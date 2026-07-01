@@ -23,8 +23,8 @@ export async function syncAndRefresh(accountId: number) {
   await refreshInbox();
 }
 
-export async function openThread(threadId: string) {
-  app.currentThread = await threadMessages(threadId);
+export async function openThread(accountId: number, threadId: string) {
+  app.currentThread = await threadMessages(accountId, threadId);
 }
 
 export function closeThread() {

@@ -5,10 +5,14 @@
 
   // Lazily-fetched bodies for meta_only messages, keyed by message id. Not
   // pushed back into app.currentThread to keep the store a plain server mirror.
-  let fetchedBodies = $state<Record<number, string>>({});
+  // A genuinely empty body is a valid fetched value, so presence is checked
+  // with `in` (not truthiness) everywhere this map is read — a falsy check
+  // would treat an empty-body message as "not fetched yet" forever and
+  // re-issue a live IMAP fetch on every render.
+  let fetchedBodies = $state<Record<number, { body: string; body_is_html: boolean }>>({});
 
   async function loadBody(messageId: number) {
-    if (fetchedBodies[messageId]) return;
+    if (messageId in fetchedBodies) return;
     fetchedBodies[messageId] = await messageBody(messageId);
   }
 </script>
@@ -23,9 +27,9 @@
         <div class="date">{msg.received_at || ""}</div>
       </header>
       {#if msg.body !== null}
-        <MessageBody body={msg.body} />
-      {:else if fetchedBodies[msg.id]}
-        <MessageBody body={fetchedBodies[msg.id]} />
+        <MessageBody body={msg.body} isHtml={msg.body_is_html} />
+      {:else if msg.id in fetchedBodies}
+        <MessageBody body={fetchedBodies[msg.id].body} isHtml={fetchedBodies[msg.id].body_is_html} />
       {:else}
         <button class="load-body" onclick={() => loadBody(msg.id)}>Load message body</button>
       {/if}

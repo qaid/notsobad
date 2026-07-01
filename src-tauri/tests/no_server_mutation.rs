@@ -13,11 +13,14 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
-// Commands that mutate a mailbox or begin a send. None may appear during validation.
-const IMAP_DENY: &[&str] = &[
-    "STORE", "MOVE", "EXPUNGE", "APPEND", "CREATE", "DELETE", "RENAME", "COPY", "SUBSCRIBE",
-    "SETACL", "SELECT", // SELECT opens read-write; we require EXAMINE instead.
-];
+// IMAP: allowlist, not denylist. A denylist of single-word mutating verbs
+// (STORE, COPY, MOVE...) misses their `UID <verb>` two-word forms, which is
+// exactly how real clients send UID-scoped mutations on the wire — a future
+// `uid_store`/`uid_copy`/`uid_move` call would slip through undetected. An
+// allowlist of the exact verbs our read-only paths are permitted to send
+// fails closed instead: anything new must be added here deliberately.
+const IMAP_ALLOW: &[&str] =
+    &["LOGIN", "CAPABILITY", "EXAMINE", "UID SEARCH", "UID FETCH", "LOGOUT"];
 const SMTP_DENY: &[&str] = &["MAIL", "RCPT", "DATA"];
 
 /// First whitespace-delimited token, uppercased — the protocol verb. For a
@@ -32,6 +35,16 @@ fn verb(line: &str) -> String {
         }
     }
     first
+}
+
+/// Locks in the fail-closed property itself: a careless future edit that adds
+/// a mutating verb (including a UID two-word form) to IMAP_ALLOW should fail
+/// this test, not just silently widen what the allowlist accepts.
+#[test]
+fn allowlist_excludes_known_mutations() {
+    for m in ["UID STORE", "UID COPY", "UID MOVE", "STORE", "COPY", "MOVE", "EXPUNGE", "APPEND", "SELECT"] {
+        assert!(!IMAP_ALLOW.contains(&m), "{m} must never be allowlisted (ADR 0003)");
+    }
 }
 
 #[test]
@@ -54,7 +67,7 @@ fn imap_validation_is_read_only() {
 
     let verbs: Vec<String> = rx.try_iter().collect();
     for v in &verbs {
-        assert!(!IMAP_DENY.contains(&v.as_str()), "mutating IMAP verb sent: {v} (all: {verbs:?})");
+        assert!(IMAP_ALLOW.contains(&v.as_str()), "non-allowlisted IMAP verb sent: {v} (all: {verbs:?})");
     }
     assert!(verbs.contains(&"EXAMINE".to_string()), "expected EXAMINE, got: {verbs:?}");
 }
@@ -78,7 +91,7 @@ fn sync_is_read_only() {
 
     let verbs: Vec<String> = rx.try_iter().collect();
     for v in &verbs {
-        assert!(!IMAP_DENY.contains(&v.as_str()), "mutating IMAP verb sent during sync: {v} (all: {verbs:?})");
+        assert!(IMAP_ALLOW.contains(&v.as_str()), "non-allowlisted IMAP verb sent during sync: {v} (all: {verbs:?})");
     }
     assert!(verbs.contains(&"EXAMINE".to_string()), "expected EXAMINE, got: {verbs:?}");
     assert!(verbs.contains(&"UID SEARCH".to_string()), "expected UID SEARCH, got: {verbs:?}");

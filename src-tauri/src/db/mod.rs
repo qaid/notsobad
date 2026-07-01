@@ -11,6 +11,7 @@ pub mod messages;
 const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0001_init.sql"),
     include_str!("../../migrations/0002_messages_readpath.sql"),
+    include_str!("../../migrations/0003_body_is_html.sql"),
 ];
 
 /// Open (creating if absent) the SQLite DB at `path` and run migrations.
@@ -68,7 +69,7 @@ mod tests {
 
         for col in [
             "subject", "from_addr", "from_name", "seen", "in_reply_to", "refs", "thread_id",
-            "snippet", "attachments",
+            "snippet", "attachments", "body_is_html",
         ] {
             let n: i64 = conn
                 .query_row(

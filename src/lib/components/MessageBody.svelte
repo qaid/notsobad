@@ -3,9 +3,12 @@
   // no mail content leaves the machine; a tracking pixel must not beacon out).
   // `sandbox` with no `allow-scripts` kills JS/XSS; the CSP blocks remote
   // img/style/font loads so only inline styles and data: images render.
-  let { body }: { body: string } = $props();
-
-  const isHtml = $derived(/<\s*(html|body|div|table|p|br)[\s>]/i.test(body));
+  //
+  // isHtml comes from the backend's own parse (mail-parser's body_html vs
+  // body_text), not a frontend tag-regex guess — a guess misclassifies real
+  // HTML mail that only uses tags like <a>/<img>/<span> and renders it as
+  // raw escaped markup instead of formatted content.
+  let { body, isHtml }: { body: string; isHtml: boolean } = $props();
 
   const srcdoc = $derived(
     isHtml

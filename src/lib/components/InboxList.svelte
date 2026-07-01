@@ -7,7 +7,7 @@
 
 <div class="inbox">
   {#each app.inbox as msg (msg.id)}
-    <button class="row" class:unread={!msg.seen} onclick={() => openThread(msg.thread_id)}>
+    <button class="row" class:unread={!msg.seen} onclick={() => openThread(msg.account_id, msg.thread_id)}>
       <div class="from">{msg.from_name || msg.from_addr || "(unknown sender)"}</div>
       <div class="subject">{msg.subject || "(no subject)"}</div>
       <div class="snippet">{msg.snippet || ""}</div>

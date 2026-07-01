@@ -7,6 +7,7 @@ use crate::db::{
 use crate::error::{AppError, Result};
 use crate::keychain;
 use crate::state::AppState;
+use serde::Serialize;
 use tauri::State;
 
 /// Test credentials against the IMAP and SMTP servers. Stores nothing.
@@ -110,27 +111,41 @@ pub fn list_inbox(state: State<'_, AppState>, account_id: Option<i64>) -> Result
     db::messages::list_inbox(&conn, account_id)
 }
 
-/// Full conversation for a thread, oldest first.
+/// Full conversation for a thread, oldest first, scoped to one account.
 #[tauri::command]
-pub fn thread_messages(state: State<'_, AppState>, thread_id: String) -> Result<Vec<MessageDetail>> {
+pub fn thread_messages(
+    state: State<'_, AppState>,
+    account_id: i64,
+    thread_id: String,
+) -> Result<Vec<MessageDetail>> {
     let conn = state.db.lock().expect("db mutex poisoned");
-    db::messages::thread_messages(&conn, &thread_id)
+    db::messages::thread_messages(&conn, account_id, &thread_id)
+}
+
+/// A message's body plus its html-vs-text flag, returned together so the
+/// frontend never has to re-guess html-vs-text from the text itself.
+#[derive(Debug, Serialize)]
+pub struct MessageBody {
+    pub body: String,
+    pub body_is_html: bool,
 }
 
 /// A message's body, fetching it on demand from the server if this is a
 /// metadata-only row that hasn't been opened yet (read-only: UID FETCH
 /// BODY.PEEK[] — never sets \Seen server-side).
 #[tauri::command]
-pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result<String> {
-    let (account_id, uid, existing_body) = {
+pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result<MessageBody> {
+    let (account_id, uid, existing_body, existing_is_html) = {
         let conn = state.db.lock().expect("db mutex poisoned");
         let (account_id, uid) = db::messages::account_and_uid(&conn, message_id)?;
-        let existing_body: Option<String> =
-            conn.query_row("SELECT body FROM messages WHERE id = ?1", [message_id], |r| r.get(0))?;
-        (account_id, uid, existing_body)
+        let (existing_body, existing_is_html): (Option<String>, i64) = conn
+            .query_row("SELECT body, body_is_html FROM messages WHERE id = ?1", [message_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        (account_id, uid, existing_body, existing_is_html)
     };
     if let Some(body) = existing_body {
-        return Ok(body);
+        return Ok(MessageBody { body, body_is_html: existing_is_html != 0 });
     }
 
     let cfg = {
@@ -139,14 +154,25 @@ pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result
     };
     let app_password = keychain::get_password(account_id)?;
 
-    let body = tauri::async_runtime::spawn_blocking(move || {
+    let fetched = tauri::async_runtime::spawn_blocking(move || {
         connection::sync::fetch_body(&cfg, &app_password, uid as u32)
     })
     .await
     .map_err(|e| AppError::Other(format!("fetch_body task failed: {e}")))?
     .map_err(AppError::Imap)?;
 
+    let attachments_json = serde_json::to_string(&fetched.attachments).unwrap_or_default();
+    let body_is_html = fetched.body_is_html;
     let conn = state.db.lock().expect("db mutex poisoned");
-    db::messages::set_body(&conn, message_id, &body)?;
-    Ok(body)
+    db::messages::set_body(
+        &conn,
+        message_id,
+        &db::messages::FetchedBody {
+            body: fetched.body.clone(),
+            body_is_html,
+            snippet: fetched.snippet,
+            attachments_json,
+        },
+    )?;
+    Ok(MessageBody { body: fetched.body, body_is_html })
 }
