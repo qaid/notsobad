@@ -38,6 +38,44 @@ pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Full connection config for an account, needed to drive sync (ports + hosts
+/// the sidebar's `Account` view doesn't carry).
+pub fn config(conn: &Connection, account_id: i64) -> Result<AccountConfig> {
+    Ok(conn.query_row(
+        "SELECT display_name, imap_host, imap_port, smtp_host, smtp_port, username
+         FROM accounts WHERE id = ?1",
+        [account_id],
+        |r| {
+            Ok(AccountConfig {
+                display_name: r.get(0)?,
+                imap_host: r.get(1)?,
+                imap_port: r.get(2)?,
+                smtp_host: r.get(3)?,
+                smtp_port: r.get(4)?,
+                username: r.get(5)?,
+            })
+        },
+    )?)
+}
+
+/// Prior UID-sync bookkeeping for an account: (uidvalidity, last_uid).
+pub fn uid_state(conn: &Connection, account_id: i64) -> Result<(Option<i64>, i64)> {
+    Ok(conn.query_row(
+        "SELECT uidvalidity, last_uid FROM accounts WHERE id = ?1",
+        [account_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+/// Persist UID-sync bookkeeping after a sync pass.
+pub fn set_uid_state(conn: &Connection, account_id: i64, uidvalidity: i64, last_uid: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE accounts SET uidvalidity = ?1, last_uid = ?2 WHERE id = ?3",
+        rusqlite::params![uidvalidity, last_uid, account_id],
+    )?;
+    Ok(())
+}
+
 pub fn list(conn: &Connection) -> Result<Vec<Account>> {
     let mut stmt = conn.prepare(
         "SELECT id, display_name, username, imap_host, smtp_host FROM accounts ORDER BY id",

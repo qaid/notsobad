@@ -25,6 +25,10 @@ pub fn run() {
             commands::validate_account,
             commands::add_account,
             commands::list_accounts,
+            commands::sync_account,
+            commands::list_inbox,
+            commands::thread_messages,
+            commands::message_body,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
