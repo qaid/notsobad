@@ -57,3 +57,18 @@ export type MessageDetail = {
   mirror_state: "full" | "meta_only";
   uid: number;
 };
+
+// Mirrors commands::TranslationResult (issue #5). `translated` is null
+// whenever no real translation happened: either the body was detected
+// already-English, or the model isn't pulled (pull_hint set in that case).
+// Render `original` (with the message's own body_is_html) whenever
+// `translated` is null — do NOT treat null as "same as original" and render
+// `original` through the plain-text translated-view path; for HTML mail that
+// shows raw markup instead of the formatted message (see ThreadReader.svelte).
+export type TranslationResult = {
+  translated: string | null;
+  original: string;
+  model: string;
+  was_cached: boolean;
+  pull_hint: string | null;
+};

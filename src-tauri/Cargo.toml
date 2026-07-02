@@ -29,6 +29,21 @@ imap = "2"
 native-tls = "0.2"
 thiserror = "2"
 mail-parser = "0.11"
+# Blocking HTTP client for the local Ollama API (issue #5). Matches this
+# codebase's existing style: IMAP/SMTP are blocking too, run inside
+# tauri::async_runtime::spawn_blocking rather than an async client fighting
+# tauri's runtime. ureq over reqwest: far fewer transitive deps for a
+# same-machine, plaintext-localhost, single-request-at-a-time call.
+ureq = { version = "2", features = ["json"] }
+# Pure-Rust, zero-network language detection (issue #5). Needed because
+# asking the LLM itself to detect-or-translate-in-one-call proved unreliable
+# in live testing against alibayram/erurollm-9b-instruct: for real French/Dutch
+# email bodies it frequently answered "UNCHANGED" (i.e. claimed the text was
+# already English) instead of translating — a small quantized model taking
+# the easy escape hatch rather than doing the harder job. A plain "translate
+# this" prompt (no UNCHANGED branch) worked reliably in the same tests, so
+# detection is split out to a deterministic, non-LLM step instead.
+whatlang = "0.18"
 
 [dev-dependencies]
 # in-process recording IMAP/SMTP server for the no-server-mutation guardrail test

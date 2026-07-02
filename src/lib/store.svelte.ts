@@ -1,4 +1,4 @@
-import type { Account, Folder, MessageDetail, MessageSummary } from "./types";
+import type { Account, Folder, MessageDetail, MessageSummary, TranslationResult } from "./types";
 import {
   listAccounts,
   listFolderMessages,
@@ -7,6 +7,7 @@ import {
   setFolderSelected,
   syncAccount,
   threadMessages,
+  translateMessage,
 } from "./ipc";
 
 // ponytail: a module-level rune object is the whole store. No external state lib
@@ -31,7 +32,47 @@ export const app = $state({
   // account's INBOX row. Fix: {accountId, name} distinguishes accounts;
   // selectUnifiedInbox() is the one explicit path back to null.
   currentFolder: null as { accountId: number; name: string } | null,
+  // Translate-on-open results (#5), keyed by message id. Additive to the
+  // per-thread fetchedBodies pattern in ThreadReader: a message only gets an
+  // entry once translate_message has been called for it (on open), so
+  // presence (not truthiness) is the "has this been translated" check —
+  // same reasoning as fetchedBodies, an all-English body legitimately
+  // produces original === translated, which is still a real result.
+  translations: {} as Record<number, TranslationResult>,
+  // "Show original" toggle state per message, default false (English shown).
+  showOriginal: {} as Record<number, boolean>,
 });
+
+// Plain (non-reactive) set of message ids with a translate_message call
+// currently in flight. ThreadReader's on-open $effect re-runs on every
+// app.currentThread/app.translations write, so guarding only on `messageId in
+// app.translations` isn't enough — every re-run before the first call
+// resolves would fire another ~seconds-long Ollama request for the same
+// message. A plain Set (not $state) is checked+added synchronously before
+// the await, so a same-tick re-entrant call is blocked immediately rather
+// than racing the first call's still-pending promise.
+const translateInFlight = new Set<number>();
+
+// Translate a message's body to English and cache the result in the store,
+// keyed by message id. No-op if already present in this session's cache, or
+// already in flight — never cleared, since the underlying ai_results row is
+// itself a permanent SQLite cache (re-opening a thread across app restarts is
+// still instant via translate_message's own DB-level cache hit). Requires the
+// body already loaded (messageBody called first) — translate_message itself
+// never talks to the mail server.
+export async function translateAndCache(messageId: number) {
+  if (messageId in app.translations || translateInFlight.has(messageId)) return;
+  translateInFlight.add(messageId);
+  try {
+    app.translations[messageId] = await translateMessage(messageId);
+  } finally {
+    translateInFlight.delete(messageId);
+  }
+}
+
+export function toggleShowOriginal(messageId: number) {
+  app.showOriginal[messageId] = !app.showOriginal[messageId];
+}
 
 export async function refreshAccounts() {
   app.accounts = await listAccounts();

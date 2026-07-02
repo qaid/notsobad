@@ -20,6 +20,9 @@ pub enum AppError {
     #[allow(dead_code)]
     Smtp(String),
 
+    #[error("AI request failed: {0}")]
+    Ai(String),
+
     #[error("{0}")]
     Other(String),
 }
