@@ -1,3 +1,4 @@
+import { goto } from "$app/navigation";
 import type { Account, Folder, MessageDetail, MessageSummary } from "./types";
 import {
   listAccounts,
@@ -8,6 +9,10 @@ import {
   syncAccount,
   threadMessages,
 } from "./ipc";
+
+export type ThemePref = "system" | "light" | "dark";
+
+const THEME_STORAGE_KEY = "theme-pref";
 
 // ponytail: a module-level rune object is the whole store. No external state lib
 // for one list + one boolean.
@@ -32,6 +37,30 @@ export const app = $state({
   // selectUnifiedInbox() is the one explicit path back to null.
   currentFolder: null as { accountId: number; name: string } | null,
 });
+
+// Separate from `app`: this is a display preference, not app data, and its
+// initial value is read from localStorage rather than an IPC call.
+export const theme = $state({
+  pref: (localStorage.getItem(THEME_STORAGE_KEY) as ThemePref | null) || "system",
+});
+
+export function setThemePref(pref: ThemePref) {
+  theme.pref = pref;
+  localStorage.setItem(THEME_STORAGE_KEY, pref);
+  applyTheme();
+}
+
+// Resolves "system" via prefers-color-scheme and writes the result to
+// data-theme on <html>, which is what +layout.svelte's CSS vars key off of.
+export function applyTheme() {
+  const resolved =
+    theme.pref === "system"
+      ? matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light"
+      : theme.pref;
+  document.documentElement.setAttribute("data-theme", resolved);
+}
 
 export async function refreshAccounts() {
   app.accounts = await listAccounts();
@@ -64,6 +93,10 @@ export async function selectFolder(accountId: number, name: string) {
   // a still-showing ThreadReader and looks like the sidebar is dead until
   // you hit the reader's back button.
   app.currentThread = null;
+  // #13 added a real /settings route. This state is only ever rendered by
+  // +page.svelte (route "/"), so clicking a folder while on /settings updated
+  // state nothing on-screen reads — looked like the sidebar had frozen.
+  await goto("/");
   await refreshInbox();
 }
 
@@ -74,6 +107,8 @@ export async function selectUnifiedInbox() {
   // Same reason as selectFolder: drop out of the thread reader so the
   // unified inbox actually shows when picked.
   app.currentThread = null;
+  // See selectFolder's comment: route back to "/" so this is visible from /settings.
+  await goto("/");
   await refreshInbox();
 }
 

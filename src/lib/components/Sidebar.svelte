@@ -78,12 +78,13 @@
       <li class="empty">No accounts yet</li>
     {/each}
   </ul>
+  <a href="/settings" class="settings-link">Settings</a>
 </aside>
 
 <style>
   .sidebar {
     width: 240px;
-    border-right: 1px solid #ddd;
+    border-right: 1px solid var(--border);
     padding: 12px;
     display: flex;
     flex-direction: column;
@@ -104,11 +105,11 @@
     border-radius: 6px;
   }
   .unified:hover {
-    background: rgba(0, 0, 0, 0.05);
+    background: var(--hover);
   }
   .unified.current {
     font-weight: 700;
-    background: rgba(0, 0, 0, 0.12);
+    background: var(--active);
   }
   ul {
     list-style: none;
@@ -123,7 +124,7 @@
     border-radius: 6px;
   }
   li:not(.empty):hover {
-    background: rgba(0, 0, 0, 0.05);
+    background: var(--hover);
   }
   .row {
     display: flex;
@@ -177,7 +178,7 @@
     border-radius: 6px;
   }
   .folder:hover {
-    background: rgba(0, 0, 0, 0.05);
+    background: var(--hover);
   }
   /* "Currently showing" state: a filled row background + bold, deliberately
      stronger than hover and visually distinct from the sync checkbox — the
@@ -186,9 +187,19 @@
   .folder.current {
     font-weight: 700;
     opacity: 1;
-    background: rgba(0, 0, 0, 0.12);
+    background: var(--active);
   }
   .folder.current:hover {
-    background: rgba(0, 0, 0, 0.12);
+    background: var(--active);
+  }
+  .settings-link {
+    padding: 8px;
+    cursor: pointer;
+    color: inherit;
+    text-decoration: none;
+  }
+  .settings-link:hover {
+    background: var(--hover);
+    border-radius: 6px;
   }
 </style>
