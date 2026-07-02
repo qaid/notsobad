@@ -138,11 +138,11 @@
     padding: 0;
   }
   .ok {
-    color: green;
+    color: var(--accent-ok);
   }
   .fail,
   .err {
-    color: #c00;
+    color: var(--accent-err);
   }
   .status-busy {
     display: flex;
@@ -152,8 +152,8 @@
   .spinner {
     width: 14px;
     height: 14px;
-    border: 2px solid var(--border, #ddd);
-    border-top-color: var(--fg, #111);
+    border: 2px solid var(--border);
+    border-top-color: var(--fg);
     border-radius: 50%;
     animation: spin 0.6s linear infinite;
   }

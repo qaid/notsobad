@@ -9,6 +9,10 @@ import {
   threadMessages,
 } from "./ipc";
 
+export type ThemePref = "system" | "light" | "dark";
+
+const THEME_STORAGE_KEY = "theme-pref";
+
 // ponytail: a module-level rune object is the whole store. No external state lib
 // for one list + one boolean.
 export const app = $state({
@@ -32,6 +36,30 @@ export const app = $state({
   // selectUnifiedInbox() is the one explicit path back to null.
   currentFolder: null as { accountId: number; name: string } | null,
 });
+
+// Separate from `app`: this is a display preference, not app data, and its
+// initial value is read from localStorage rather than an IPC call.
+export const theme = $state({
+  pref: (localStorage.getItem(THEME_STORAGE_KEY) as ThemePref | null) || "system",
+});
+
+export function setThemePref(pref: ThemePref) {
+  theme.pref = pref;
+  localStorage.setItem(THEME_STORAGE_KEY, pref);
+  applyTheme();
+}
+
+// Resolves "system" via prefers-color-scheme and writes the result to
+// data-theme on <html>, which is what +layout.svelte's CSS vars key off of.
+export function applyTheme() {
+  const resolved =
+    theme.pref === "system"
+      ? matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light"
+      : theme.pref;
+  document.documentElement.setAttribute("data-theme", resolved);
+}
 
 export async function refreshAccounts() {
   app.accounts = await listAccounts();
