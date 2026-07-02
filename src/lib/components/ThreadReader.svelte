@@ -10,27 +10,49 @@
   // would treat an empty-body message as "not fetched yet" forever and
   // re-issue a live IMAP fetch on every render.
   let fetchedBodies = $state<Record<number, { body: string; body_is_html: boolean }>>({});
+  let bodyLoadInFlight = new Set<number>();
+  let translateErrors = $state<Record<number, string>>({});
 
   async function loadBody(messageId: number) {
-    if (messageId in fetchedBodies) return;
-    fetchedBodies[messageId] = await messageBody(messageId);
+    if (messageId in fetchedBodies || bodyLoadInFlight.has(messageId)) return;
+    bodyLoadInFlight.add(messageId);
+    try {
+      fetchedBodies[messageId] = await messageBody(messageId);
+    } finally {
+      bodyLoadInFlight.delete(messageId);
+    }
     // Body just became available — translate now rather than waiting for a
     // second click, matching the "opening a message translates it" AC.
-    translateAndCache(messageId).catch((e) => console.error("translate failed", e));
+    runTranslate(messageId);
   }
 
-  // On-open timing (#5): as soon as a message's body is already available
-  // (full-mirror row, so msg.body is non-null straight from thread_messages),
-  // translate it immediately — no separate click needed. For a meta_only
-  // message, translation instead starts from loadBody once its body arrives.
-  // Errors are caught here (not awaited/propagated): a translation failure
-  // must not block the message body itself from rendering, and this effect
-  // has no UI of its own to report to — the original still renders natively
-  // since app.translations[msg.id] simply never gets set.
+  function runTranslate(messageId: number) {
+    translateAndCache(messageId)
+      .then(() => {
+        delete translateErrors[messageId];
+      })
+      .catch((e) => {
+        console.error("translate failed", e);
+        translateErrors[messageId] = String(e);
+      });
+  }
+
+  // On-open timing (#5): every synced message is stored meta_only (headers
+  // only, no body — see connection/sync.rs) to avoid an eager IMAP body fetch
+  // per message, so msg.body is ALWAYS null straight from thread_messages in
+  // practice; loadBody is what actually fetches it. This effect drives that
+  // fetch automatically on open instead of waiting for the user to notice and
+  // click "Load message body" — that manual-click gate was the reason #5's
+  // first device test found translate never ran on any real mail. The
+  // msg.body !== null branch is kept for a hypothetical full-mirror row (e.g.
+  // a future eager-sync mode) so this doesn't silently skip a body that's
+  // already there.
   $effect(() => {
     for (const msg of app.currentThread ?? []) {
       if (msg.body !== null) {
-        translateAndCache(msg.id).catch((e) => console.error("translate failed", e));
+        runTranslate(msg.id);
+      } else if (!(msg.id in fetchedBodies)) {
+        loadBody(msg.id);
       }
     }
   });
@@ -51,6 +73,8 @@
       </header>
       {#if translation?.pull_hint}
         <p class="pull-hint">{translation.pull_hint}</p>
+      {:else if translateErrors[msg.id]}
+        <p class="pull-hint">Translation failed: {translateErrors[msg.id]}</p>
       {/if}
       {#if original !== undefined}
         {#if hasRealTranslation && !app.showOriginal[msg.id]}
