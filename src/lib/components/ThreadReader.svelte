@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app, closeThread } from "../store.svelte";
+  import { app, closeThread, translateAndCache, toggleShowOriginal } from "../store.svelte";
   import { messageBody } from "../ipc";
   import MessageBody from "./MessageBody.svelte";
 
@@ -14,22 +14,64 @@
   async function loadBody(messageId: number) {
     if (messageId in fetchedBodies) return;
     fetchedBodies[messageId] = await messageBody(messageId);
+    // Body just became available — translate now rather than waiting for a
+    // second click, matching the "opening a message translates it" AC.
+    translateAndCache(messageId).catch((e) => console.error("translate failed", e));
   }
+
+  // On-open timing (#5): as soon as a message's body is already available
+  // (full-mirror row, so msg.body is non-null straight from thread_messages),
+  // translate it immediately — no separate click needed. For a meta_only
+  // message, translation instead starts from loadBody once its body arrives.
+  // Errors are caught here (not awaited/propagated): a translation failure
+  // must not block the message body itself from rendering, and this effect
+  // has no UI of its own to report to — the original still renders natively
+  // since app.translations[msg.id] simply never gets set.
+  $effect(() => {
+    for (const msg of app.currentThread ?? []) {
+      if (msg.body !== null) {
+        translateAndCache(msg.id).catch((e) => console.error("translate failed", e));
+      }
+    }
+  });
 </script>
 
 <div class="thread">
   <button class="back" onclick={closeThread}>&larr; Back to inbox</button>
   {#each app.currentThread ?? [] as msg (msg.id)}
+    {@const original = msg.body !== null ? msg.body : fetchedBodies[msg.id]?.body}
+    {@const isHtml = msg.body !== null ? msg.body_is_html : fetchedBodies[msg.id]?.body_is_html}
+    {@const translation = app.translations[msg.id]}
+    {@const hasRealTranslation = translation?.translated != null}
     <article class="message">
       <header>
         <div class="from">{msg.from_name || msg.from_addr || "(unknown sender)"}</div>
         <div class="subject">{msg.subject || "(no subject)"}</div>
         <div class="date">{msg.received_at || ""}</div>
       </header>
-      {#if msg.body !== null}
-        <MessageBody body={msg.body} isHtml={msg.body_is_html} />
-      {:else if msg.id in fetchedBodies}
-        <MessageBody body={fetchedBodies[msg.id].body} isHtml={fetchedBodies[msg.id].body_is_html} />
+      {#if translation?.pull_hint}
+        <p class="pull-hint">{translation.pull_hint}</p>
+      {/if}
+      {#if original !== undefined}
+        {#if hasRealTranslation && !app.showOriginal[msg.id]}
+          <!-- Inline-replaced by default: translated text is always plain
+               text (the model translates prose, not markup), regardless of
+               whether the original was HTML. `translated` is only non-null
+               here (hasRealTranslation), never a same-as-original stand-in —
+               see TranslationResult's doc comment for why that distinction
+               matters for HTML mail. -->
+          <MessageBody body={translation.translated ?? ""} isHtml={false} />
+        {:else}
+          <!-- No real translation (already-English, or model-not-pulled) —
+               render the original natively with its own body_is_html, never
+               through the plain-text translated-view branch. -->
+          <MessageBody body={original} isHtml={isHtml ?? false} />
+        {/if}
+        {#if hasRealTranslation}
+          <button class="toggle-original" onclick={() => toggleShowOriginal(msg.id)}>
+            {app.showOriginal[msg.id] ? "Show translation" : "Show original"}
+          </button>
+        {/if}
       {:else}
         <button class="load-body" onclick={() => loadBody(msg.id)}>Load message body</button>
       {/if}
@@ -76,5 +118,24 @@
   }
   .load-body {
     cursor: pointer;
+  }
+  .toggle-original {
+    margin-top: 8px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.85em;
+    opacity: 0.7;
+    padding: 4px 0;
+    text-decoration: underline;
+  }
+  .pull-hint {
+    background: #fff8e1;
+    border: 1px solid #f0d878;
+    border-radius: 6px;
+    font-size: 0.9em;
+    margin: 0 0 8px 0;
+    padding: 8px 10px;
   }
 </style>

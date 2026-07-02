@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 pub mod accounts;
+pub mod ai_results;
 pub mod folders;
 pub mod messages;
 

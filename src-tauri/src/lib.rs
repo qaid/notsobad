@@ -1,3 +1,4 @@
+mod ai;
 mod commands;
 pub mod connection;
 mod db;
@@ -32,6 +33,7 @@ pub fn run() {
             commands::list_folder_messages,
             commands::thread_messages,
             commands::message_body,
+            commands::translate_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -5,6 +5,7 @@ import type {
   Folder,
   MessageDetail,
   MessageSummary,
+  TranslationResult,
   ValidationOutcome,
 } from "./types";
 
@@ -46,3 +47,9 @@ export const threadMessages = (accountId: number, threadId: string) =>
 // body_is_html is the backend's own parser signal, not a frontend guess.
 export const messageBody = (messageId: number) =>
   invoke<{ body: string; body_is_html: boolean }>("message_body", { messageId });
+
+// Translate-on-open (#5). Local-only via Ollama (CLAUDE.md); cache-first, so
+// re-opening a thread is instant. Requires the body already loaded — call
+// messageBody first for a meta_only message.
+export const translateMessage = (messageId: number) =>
+  invoke<TranslationResult>("translate_message", { messageId });
