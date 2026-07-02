@@ -1,3 +1,4 @@
+use crate::ai::{self, ollama::OllamaError, Task};
 use crate::connection::{self, AccountConfig, ValidationOutcome};
 use crate::db::{
     self,
@@ -295,6 +296,120 @@ pub async fn message_body(state: State<'_, AppState>, message_id: i64) -> Result
         },
     )?;
     Ok(MessageBody { body: fetched.body, body_is_html })
+}
+
+/// Result of `translate_message`.
+///
+/// `translated` is `None` when no real translation happened: either
+/// detection decided the body was already English (Ollama never called), or
+/// the model isn't pulled (`pull_hint` is `Some` in that case — `AppError`
+/// serializes to a bare string over IPC, see error.rs, so this structured
+/// field is how the frontend distinguishes "pull this model" from a generic
+/// failure without string-matching an error message). This is deliberately
+/// NOT "translated == original as a String": that shape bit the frontend
+/// once already — for an HTML message with no real translation, the naive
+/// fallback returned the raw HTML source as `translated`, and the "show
+/// English by default" render branch put it through the plain-text renderer,
+/// showing literal `<html>...` markup instead of the original rendered mail.
+/// `Option<String>` makes "no translation occurred" a case the frontend must
+/// handle explicitly (fall back to rendering `original` with its real
+/// `body_is_html` flag) instead of a string value it can silently mishandle.
+#[derive(Debug, Serialize)]
+pub struct TranslationResult {
+    pub translated: Option<String>,
+    pub original: String,
+    pub model: String,
+    pub was_cached: bool,
+    pub pull_hint: Option<String>,
+}
+
+/// Translate a message's body to English (issue #5), on-open (called by the
+/// frontend when a thread/message is opened, not on arrival).
+///
+/// Cache-first: a prior `kind='translation'` row in `ai_results` is returned
+/// instantly with no Ollama call. On a miss, calls Ollama (local only —
+/// CLAUDE.md) via `ai::translate::translate`, which tries the configured
+/// primary model first and falls back to the configured fallback if the
+/// primary isn't pulled (see `ai::Task::primary_model`/`fallback_model`).
+///
+/// Requires the body already loaded (i.e. the frontend calls `message_body`
+/// first for a meta_only message) — this command does not itself reach out
+/// to IMAP, keeping the "who talks to the mail server" surface to exactly the
+/// existing `message_body`/`sync_account` paths.
+#[tauri::command]
+pub async fn translate_message(state: State<'_, AppState>, message_id: i64) -> Result<TranslationResult> {
+    let (body, body_is_html, cached) = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let (body, body_is_html): (Option<String>, i64) = conn.query_row(
+            "SELECT body, body_is_html FROM messages WHERE id = ?1",
+            [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let cached = db::ai_results::get(&conn, message_id, "translation")?;
+        (body, body_is_html != 0, cached)
+    };
+    let body = body.ok_or_else(|| {
+        AppError::Other("message body not loaded yet; call message_body before translate_message".into())
+    })?;
+
+    if let Some(cached) = cached {
+        return Ok(TranslationResult {
+            translated: Some(cached.result),
+            original: body,
+            model: cached.model,
+            was_cached: true,
+            pull_hint: None,
+        });
+    }
+
+    let body_for_task = body.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        ai::translate::translate(Task::Translate, &body_for_task, body_is_html)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("translate task panicked: {e}")))?;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(OllamaError::ModelNotPulled { model }) => {
+            return Ok(TranslationResult {
+                translated: None,
+                original: body,
+                model: String::new(),
+                was_cached: false,
+                pull_hint: Some(format!("Model not pulled. Run: ollama pull {model}")),
+            });
+        }
+        Err(OllamaError::Other(msg)) => return Err(AppError::Ai(msg)),
+    };
+
+    // `outcome.translated` is None when deterministic detection
+    // (ai::translate's whatlang step) decided the body is already English —
+    // Ollama was never called. Don't write a cache row for that case:
+    // detection is instant and free to re-run, so there's nothing worth
+    // caching. Propagate None through rather than substituting `body` as a
+    // stand-in "translation" — see TranslationResult's doc comment for why
+    // that substitution is the bug this shape prevents.
+    let Some(translated) = outcome.translated else {
+        return Ok(TranslationResult {
+            translated: None,
+            original: body,
+            model: String::new(),
+            was_cached: false,
+            pull_hint: None,
+        });
+    };
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    db::ai_results::upsert(&conn, message_id, "translation", &translated, &outcome.model_used)?;
+
+    Ok(TranslationResult {
+        translated: Some(translated),
+        original: body,
+        model: outcome.model_used,
+        was_cached: false,
+        pull_hint: None,
+    })
 }
 
 #[cfg(test)]
