@@ -24,6 +24,7 @@
 
 <style>
   :global(:root) {
+    color-scheme: light;
     --bg: #fff;
     --fg: #111;
     --border: #ddd;
@@ -33,6 +34,7 @@
     --accent-err: #c00;
   }
   :global([data-theme="dark"]) {
+    color-scheme: dark;
     --bg: #1e1e1e;
     --fg: #eee;
     --border: #444;
