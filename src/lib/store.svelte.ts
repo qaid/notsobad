@@ -1,3 +1,4 @@
+import { goto } from "$app/navigation";
 import type { Account, Folder, MessageDetail, MessageSummary, TranslationResult } from "./types";
 import {
   listAccounts,
@@ -133,6 +134,10 @@ export async function selectFolder(accountId: number, name: string) {
   // a still-showing ThreadReader and looks like the sidebar is dead until
   // you hit the reader's back button.
   app.currentThread = null;
+  // #13 added a real /settings route. This state is only ever rendered by
+  // +page.svelte (route "/"), so clicking a folder while on /settings updated
+  // state nothing on-screen reads — looked like the sidebar had frozen.
+  await goto("/");
   await refreshInbox();
 }
 
@@ -143,6 +148,8 @@ export async function selectUnifiedInbox() {
   // Same reason as selectFolder: drop out of the thread reader so the
   // unified inbox actually shows when picked.
   app.currentThread = null;
+  // See selectFolder's comment: route back to "/" so this is visible from /settings.
+  await goto("/");
   await refreshInbox();
 }
 
