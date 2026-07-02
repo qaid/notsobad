@@ -34,7 +34,7 @@ mail-parser = "0.11"
 # tauri::async_runtime::spawn_blocking rather than an async client fighting
 # tauri's runtime. ureq over reqwest: far fewer transitive deps for a
 # same-machine, plaintext-localhost, single-request-at-a-time call.
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
 # Pure-Rust, zero-network language detection (issue #5). Needed because
 # asking the LLM itself to detect-or-translate-in-one-call proved unreliable
 # in live testing against alibayram/erurollm-9b-instruct: for real French/Dutch

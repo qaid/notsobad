@@ -107,7 +107,7 @@ fn is_non_english(body: &str) -> bool {
 }
 
 fn prompt_for(body: &str) -> String {
-    format!("Translate the following text to English:\n\n{body}")
+    format!("Translate the following text to English. Reply with ONLY the translation, no commentary or preamble:\n\n{body}")
 }
 
 /// Try the task's primary model, falling back to its configured fallback (if
